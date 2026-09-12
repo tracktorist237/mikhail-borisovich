@@ -1,0 +1,10 @@
+{
+  "model_path": "models/vosk-model-small-ru-0.22",
+  "voice": "auto",
+  "input_device": null,
+  "sample_rate": 16000,
+  "command_timeout": 12,
+  "silence_rms": 100,
+  "volume_step": 10,
+  "tts_cooldown_ms": 500
+}
