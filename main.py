@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Михаил Борисович: локальный голосовой ассистент v0.1.1."""
+"""Михаил Борисович: локальный голосовой ассистент v0.2."""
 import argparse
 from array import array
 from collections import deque
@@ -17,6 +17,8 @@ import subprocess
 import sys
 import tempfile
 import time
+
+from chatgpt_bridge import Bridge, OutputGuard, LOCAL_MODE, CHATGPT_MODE
 
 ROOT = Path(__file__).resolve().parent
 
@@ -155,6 +157,8 @@ def number_words(n):
 
 NUMBERS = {number_words(n): n for n in range(101)}
 INTENTS = {
+    'CHATGPT_OPEN': ['позови chatgpt', 'позови чат жпт', 'открой chatgpt', 'открой чат жпт', 'хочу поговорить с chatgpt', 'чат жпт'],
+    'CHATGPT_CLOSE': ['закрой chatgpt', 'закрой чат жпт', 'вернись', 'верни Михаила', 'закончи разговор'],
     'TIME': ['который час', 'сколько времени', 'время', 'час'],
     'DATE': ['какая дата', 'какое сегодня число', 'сегодняшняя дата', 'дата'],
     'INTERNET': ['есть интернет', 'интернет', 'проверь интернет', 'есть связь'],
@@ -170,6 +174,7 @@ COMMANDS = [phrase for phrases in INTENTS.values() for phrase in phrases]
 # В словаре Vosk Firefox представлен фонетически.
 COMMANDS = [phrase.replace('firefox', alias) for phrase in COMMANDS
             for alias in ('файр фокс', 'фаер фокс', 'браузер')]
+COMMANDS = [p.replace('chatgpt', 'чат ж п т').replace('жпт', 'ж п т').lower() for p in COMMANDS]
 GRAMMAR = list(dict.fromkeys(COMMANDS + ['открой', 'закрой', 'файр фокс', 'браузер',
     'пять файр фокс', 'открой час', 'процент замолчи', 'пожалуйста'] +
     [f'громкость {w} {ending}' for w in NUMBERS
@@ -179,14 +184,24 @@ UNKNOWN = 'Не понял. Повторите команду.'
 
 def normalize(text):
     text = ' '.join(re.sub(r'[^а-яa-z0-9\s]', ' ', text.lower().replace('ё', 'е')).split())
+    text = re.sub(r'\b(?:чат ж\s*п\s*т|чат джи пи ти)\b', 'chatgpt', text)
     return re.sub(r'\b(?:файр фокс|фаер фокс|файрфокс|фаерфокс|браузер)\b', 'firefox', text)
 
 
 def match_intent(text, pending=None):
     text = normalize(text)
+    if text == 'закрой чат ж п':
+        text = 'закрой chatgpt'
     words = set(text.split())
     if words & {'стоп', 'замолчи', 'хватит'}:
         return 'STOP', None
+    # ChatGPT names are matched before generic browser verbs. Reject mixed actions.
+    trimmed = ' '.join(w for w in text.split() if w not in {'ну', 'пожалуйста'})
+    for intent in ('CHATGPT_CLOSE', 'CHATGPT_OPEN'):
+        if trimmed in {normalize(p) for p in INTENTS[intent]}:
+            return intent, None
+    if 'chatgpt' in words:
+        return None, None
     # Глагол действия блокирует случайное совпадение с «час» и другими запросами.
     actions = words & {'открой', 'закрой'}
     if actions:
@@ -201,7 +216,7 @@ def match_intent(text, pending=None):
         if raw.isdecimal() or raw in NUMBERS:
             return 'VOLUME_SET', match[0]
     found = {intent for intent, phrases in INTENTS.items()
-             if any(f' {phrase} ' in f' {text} ' for phrase in phrases)}
+             if intent not in ('CHATGPT_OPEN', 'CHATGPT_CLOSE') and any(f' {phrase} ' in f' {text} ' for phrase in phrases)}
     if len(found) == 1:
         return found.pop(), None
     return None, None
@@ -258,6 +273,8 @@ def command(text, cfg, speech, intent=None, value=None):
     log('COMMAND', text)
     if intent is None:
         intent, value = match_intent(text)
+    if intent in ('CHATGPT_OPEN', 'CHATGPT_CLOSE'):
+        return 'Команда ChatGPT доступна в голосовом цикле.'
     if intent == 'STOP':
         speech.stop()
         return None
@@ -344,6 +361,14 @@ def listen(cfg, duration=0):
     wake = recognizer(['михаил', 'михаил борисович', '[unk]'])
     commands = recognizer(GRAMMAR)
     session = CommandSession()
+    mode = LOCAL_MODE
+    bridge = Bridge()
+    guard = OutputGuard()
+    control = recognizer(['михаил борисович', 'закрой чат ж п т', 'вернись', 'верни михаила', 'закончи разговор', '[unk]'])
+    armed_until = 0
+    pending_action = None
+    job = None
+    job_action = None
     accept_after = float('inf')
 
     def clear_audio():
@@ -378,7 +403,13 @@ def listen(cfg, duration=0):
                     deadline = time.monotonic() + cfg.get('tts_cooldown_ms', 500) / 1000
                     clear_audio()
                 if state == 'cooldown' and time.monotonic() >= deadline:
-                    state = next_state
+                    if pending_action:
+                        job_action = pending_action
+                        job = bridge.submit(pending_action)
+                        pending_action = None
+                        state = 'chatgpt_busy'
+                    else:
+                        state = next_state
                     wake.Reset()
                     commands.Reset()
                     clear_audio()
@@ -387,6 +418,23 @@ def listen(cfg, duration=0):
                     preroll.clear()
                     deadline = time.monotonic() + cfg['command_timeout']
                     log('LISTENING' if state == 'listening' else 'WAITING')
+                if job is not None and job.done():
+                    result = job.result()
+                    job = None
+                    log('CHATGPT', result['detail'])
+                    clear_audio()
+                    control.Reset()
+                    if job_action == 'close' and result['ok']:
+                        mode = LOCAL_MODE
+                        guard.close()
+                        guard = OutputGuard()
+                        log(mode)
+                        speech.say('Я снова слушаю.', remember=False)
+                    elif job_action == 'close':
+                        log('ERROR', 'Возврат заблокирован: завершение Voice не подтверждено. Завершите Voice вручную.')
+                    elif not result['ok']:
+                        speech.say('Не удалось подтвердить запуск голоса. Проверьте кнопку голосового режима в Firefox.', remember=False)
+                    state, next_state = 'speaking', 'waiting'
                 if state == 'listening' and time.monotonic() > deadline:
                     speech.say('Не услышал команду.', remember=False)
                     state, next_state = 'speaking', 'waiting'
@@ -397,7 +445,25 @@ def listen(cfg, duration=0):
                         raise RuntimeError('Микрофон не передает звук более трех секунд.')
                     continue
                 last_audio = time.monotonic()
-                if state in ('speaking', 'cooldown') or captured <= accept_after:
+                if state in ('speaking', 'cooldown', 'chatgpt_busy') or captured <= accept_after:
+                    continue
+                if mode == CHATGPT_MODE:
+                    now = time.monotonic()
+                    if not guard.allows(now):
+                        control.Reset()
+                        armed_until = 0
+                        clear_audio()
+                        continue
+                    if control.AcceptWaveform(data):
+                        text = normalize(json.loads(control.Result()).get('text', ''))
+                        if text == 'михаил борисович':
+                            armed_until = now + cfg['command_timeout']
+                            log('CHATGPT', 'Ожидаю команду возврата (без голосового ответа).')
+                        elif now < armed_until and match_intent(text)[0] == 'CHATGPT_CLOSE' and guard.quiet():
+                            job_action = 'close'
+                            job = bridge.submit('close')
+                            state = 'chatgpt_busy'
+                            armed_until = 0
                     continue
                 if state == 'waiting':
                     samples = array('h', data)[::4]
@@ -423,7 +489,16 @@ def listen(cfg, duration=0):
                     state, next_state = 'speaking', 'listening'
                 elif state == 'listening' and final and text:
                     try:
-                        answer, next_state = session.handle(text, cfg, speech)
+                        intent, _ = match_intent(text)
+                        if intent == 'CHATGPT_OPEN':
+                            mode = CHATGPT_MODE
+                            log(mode)
+                            pending_action = 'open'
+                            answer, next_state = 'Открываю ChatGPT.', 'waiting'
+                        elif intent == 'CHATGPT_CLOSE':
+                            answer, next_state = 'Я снова слушаю.', 'waiting'
+                        else:
+                            answer, next_state = session.handle(text, cfg, speech)
                     except (RuntimeError, OSError, ValueError) as exc:
                         log('ERROR', str(exc))
                         answer = 'Не удалось выполнить команду.'
@@ -432,6 +507,8 @@ def listen(cfg, duration=0):
                         speech.say(answer, remember=answer not in (UNKNOWN, 'Не понял. Возвращаюсь в режим ожидания.'))
                     state = 'speaking'
     finally:
+        bridge.close()
+        guard.close()
         speech.close()
 
 

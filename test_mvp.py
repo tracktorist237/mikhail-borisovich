@@ -135,11 +135,13 @@ class IntentTests(unittest.TestCase):
         self.assertTrue(delivered)
 
 
-def recognition():
+def recognition(chatgpt=False):
     _, Model, Recognizer = main.dependencies(audio=False)
     cfg = main.config()
     model = main.load_model(cfg, Model)
     phrases = ['михаил', 'михаил борисович', 'который час', 'сколько времени', 'какая дата', 'громче', 'тише', 'громкость пятьдесят процентов', 'открой файрфокс', 'закрой файрфокс', 'есть интернет', 'какой заряд', 'повтори', 'стоп', 'замолчи']
+    if chatgpt:
+        phrases = ['позови чат ж п т', 'открой чат ж п т', 'хочу поговорить с чат ж п т', 'чат ж п т', 'закрой чат ж п т', 'вернись', 'верни михаила', 'закончи разговор']
     failures = []
     with tempfile.TemporaryDirectory() as tmp:
         path = str(Path(tmp) / 'test.wav')
@@ -161,7 +163,9 @@ def recognition():
             rec.AcceptWaveform(converted.tobytes())
             result = json.loads(rec.FinalResult())['text']
             print(f'[TEST] {phrase} -> {result}', flush=True)
-            if main.normalize(result) != main.normalize(phrase):
+            actual = main.match_intent(result)[0] if chatgpt else main.normalize(result)
+            expected = main.match_intent(phrase)[0] if chatgpt else main.normalize(phrase)
+            if actual != expected:
                 failures.append((phrase, result))
     if failures:
         raise AssertionError(f'Ошибки распознавания: {failures}')
@@ -169,7 +173,9 @@ def recognition():
 
 if __name__ == '__main__':
     import sys
-    if '--recognition' in sys.argv:
+    if '--recognition-chatgpt' in sys.argv:
+        recognition(chatgpt=True)
+    elif '--recognition' in sys.argv:
         recognition()
     else:
         unittest.main()
