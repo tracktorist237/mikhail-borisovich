@@ -6,5 +6,15 @@
   "command_timeout": 12,
   "silence_rms": 100,
   "volume_step": 10,
-  "tts_cooldown_ms": 500
+  "tts_cooldown_ms": 500,
+  "speaker_rms": 100,
+  "speaker_peak": 1000,
+  "speaker_silence_ms": 800,
+  "dictation_rms": 250,
+  "dictation_silence_ms": 1400,
+  "dictation_max_seconds": 45,
+  "reply_timeout": 180,
+  "firefox_profile": "~/snap/firefox/common/mb-profile",
+  "firefox_binary": "/snap/firefox/current/usr/lib/firefox/firefox",
+  "geckodriver": "/snap/bin/geckodriver"
 }
