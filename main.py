@@ -53,8 +53,11 @@ def config():
         raise ValueError('Некорректные speaker_rms / speaker_peak')
     if not 100 <= cfg.get('speaker_silence_ms', 800) <= 5000:
         raise ValueError('speaker_silence_ms должен быть от 100 до 5000')
-    if not 0 < cfg.get('dictation_rms', 250) <= 32767 or not 500 <= cfg.get('dictation_silence_ms', 1400) <= 5000:
+    if not 0 < cfg.get('dictation_rms', 1000) <= 32767 or not 500 <= cfg.get('dictation_silence_ms', 1400) <= 5000:
         raise ValueError('Некорректные параметры диктовки')
+    if cfg.get('dictation_stop_method', 'os-keyboard') not in {
+            'os-keyboard', 'native', 'dom', 'bidi', 'keyboard'}:
+        raise ValueError('Недопустимый dictation_stop_method')
     if not 5 <= cfg.get('dictation_max_seconds', 45) <= 120 or not 10 <= cfg.get('reply_timeout', 180) <= 600:
         raise ValueError('Некорректные таймауты GPT')
     return cfg

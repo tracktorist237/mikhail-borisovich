@@ -25,6 +25,7 @@ class Bridge:
                 self.ui.open()
                 return {'ok': True, 'detail': 'Текстовый ChatGPT готов.'}
             functions = {'close': self.ui.close, 'pause': self.ui.pause,
+                         'abort_dictation': self.ui.abort_dictation,
                          'resume': self.ui.resume_voice, 'dictate': self.ui.start_dictation,
                          'transcribe': self.ui.stop_dictation, 'send': self.ui.send,
                          'poll': self.ui.poll}

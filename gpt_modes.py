@@ -113,7 +113,7 @@ class GPTModes:
                 self.say('Говорите после начала диктовки. Завершите вопрос паузой.', 'dictate', now)
             else:
                 self.phase = 'voice'
-        elif action == 'pause':
+        elif action in ('pause', 'abort_dictation'):
             self.say('Слушаю', 'control', now)
         elif action == 'resume':
             self.phase = 'voice'
@@ -214,6 +214,8 @@ class GPTModes:
             self.chunks = []
             if self.phase == 'error_wait':
                 self.say('Слушаю', 'control', now)
+            elif self.phase == 'dictating':
+                self.submit('abort_dictation', 'pausing')
             elif self.job is not None:
                 self.interrupt = True
             else:

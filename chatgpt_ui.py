@@ -155,6 +155,33 @@ class ChatGPTUI:
             self.wait(lambda: self.snapshot()['dictate'], 'отмена диктовки')
         return {'ok': True, 'detail': 'Ввод GPT приостановлен.'}
 
+    def abort_dictation(self):
+        """Stop capture without sending, wait for transcription, then clear it."""
+        method = self.cfg.get('dictation_stop_method', 'os-keyboard')
+        if method == 'os-keyboard':
+            # ARM_STOP_KEY was installed before capture. Do not send any
+            # WebDriver command while Firefox is recording: that is the state
+            # in which Marionette/BiDi is known to stop responding.
+            self.stop_dictation()
+            self.wait(lambda: not self.snapshot()['recording'],
+                      'завершение диктовки перед возвратом', 30)
+            self.wait(lambda: self.snapshot()['composer'] is not None,
+                      'восстановление composer после диктовки', 30)
+            state = self.snapshot()
+        else:
+            state = self.snapshot()
+            if state['recording']:
+                raise UIError('Отмена диктовки требует os-keyboard Stop')
+        if state['composer']:
+            editor = self.driver.find_element('css selector',
+                                               '#prompt-textarea[contenteditable="true"]')
+            from selenium.webdriver.common.keys import Keys
+            editor.send_keys(Keys.CONTROL, 'a')
+            editor.send_keys(Keys.BACKSPACE)
+            self.wait(lambda: not self.snapshot()['composer'],
+                      'очистка composer', 15)
+        return {'ok': True, 'detail': 'Диктовка отменена, текст не отправлен.'}
+
     def resume_voice(self):
         s = self.snapshot()
         if s['mic_off']:

@@ -183,6 +183,32 @@ class ModeTests(unittest.TestCase):
 
 
 class UITests(unittest.TestCase):
+    def test_production_config_arms_os_keyboard_stop(self):
+        cfg = main.config()
+        self.assertEqual(cfg['dictation_stop_method'], 'os-keyboard')
+        ui = ChatGPTUI(cfg)
+        ui.driver = Mock()
+        ui.snapshot = Mock(return_value={
+            'end_voice': False, 'composer': '', 'recording': True})
+        ui.wait = Mock()
+        ui.capture_ready = Mock(return_value=True)
+        ui.click = Mock()
+        ui.start_dictation()
+        ui.driver.execute_script.assert_called_once_with(ui.ARM_STOP_KEY)
+        ui.click.assert_called_once_with('Start dictation', 'Начать диктовку')
+
+    def test_abort_dictation_stops_before_first_snapshot(self):
+        cfg = main.config()
+        ui = ChatGPTUI(cfg)
+        events = []
+        ui.stop_dictation = Mock(side_effect=lambda: events.append('stop'))
+        ui.snapshot = Mock(side_effect=lambda: (events.append('snapshot') or {
+            'recording': False, 'composer': ''}))
+        ui.wait = Mock(side_effect=lambda condition, *args: condition())
+        result = ui.abort_dictation()
+        self.assertTrue(result['ok'])
+        self.assertEqual(events[:2], ['stop', 'snapshot'])
+
     def test_send_requires_visible_transcription(self):
         ui=ChatGPTUI();ui.click=Mock()
         ui.snapshot=Mock(return_value={'recording':False,'composer':'','send':True,'end_voice':False})
