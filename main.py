@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import threading
 import re
 import resource
 import shutil
@@ -20,8 +21,56 @@ import time
 
 from chatgpt_bridge import Bridge, OutputGuard, LOCAL_MODE, LARISA_MODE, ANTON_MODE
 from gpt_modes import GPTModes, CONTROL_GRAMMAR
+from diagnostics import cleanup_log, silence_broken_stream, output_lost
 
 ROOT = Path(__file__).resolve().parent
+
+
+class FreshAudioQueue:
+    """Bounded callback queue which always keeps the newest audio blocks."""
+    def __init__(self, maxsize=12):
+        if maxsize < 1:
+            raise ValueError('maxsize must be positive')
+        self.maxsize = maxsize
+        self.items = deque()
+        self.condition = threading.Condition()
+        self.dropped = 0
+        self.discontinuities = 0
+        self.pending_gap = False
+
+    def put_latest(self, item, discontinuity=False):
+        with self.condition:
+            gap = False
+            if len(self.items) >= self.maxsize:
+                self.items.popleft()
+                self.dropped += 1
+                self.discontinuities += 1
+                self.pending_gap = True
+                gap = True
+            self.items.append((*item, discontinuity))
+            self.condition.notify()
+            return gap
+
+    def get(self, timeout=None):
+        with self.condition:
+            if not self.items:
+                if not self.condition.wait(timeout):
+                    raise queue.Empty
+            if not self.items:
+                raise queue.Empty
+            captured, data, device_gap = self.items.popleft()
+            gap = self.pending_gap or device_gap
+            self.pending_gap = False
+            return captured, data, gap
+
+    def get_nowait(self):
+        return self.get(0)
+
+    def take_dropped(self):
+        with self.condition:
+            count = self.dropped
+            self.dropped = 0
+            return count
 
 
 def log(state, message=''):
@@ -60,6 +109,8 @@ def config():
         raise ValueError('Недопустимый dictation_stop_method')
     if not 5 <= cfg.get('dictation_max_seconds', 45) <= 120 or not 10 <= cfg.get('reply_timeout', 180) <= 600:
         raise ValueError('Некорректные таймауты GPT')
+    if not .5 <= cfg.get('browser_close_timeout', 12) <= 60:
+        raise ValueError('browser_close_timeout должен быть от 0.5 до 60 секунд')
     return cfg
 
 
@@ -358,18 +409,14 @@ def listen(cfg, duration=0, check_mode=None):
     sd, Model, Recognizer = dependencies()
     model = load_model(cfg, Model)
     speech = Speech(cfg)
-    audio = queue.Queue(maxsize=12)
+    audio = FreshAudioQueue(maxsize=12)
     issues = queue.Queue(maxsize=1)
     rate = cfg['sample_rate']
     block = rate // 10
     def callback(data, frames, timing, status):
         if status and issues.empty():
             issues.put_nowait(str(status))
-        try:
-            audio.put_nowait((time.monotonic(), bytes(data)))
-        except queue.Full:
-            if issues.empty():
-                issues.put_nowait('Очередь микрофона переполнена; CPU не успевает.')
+        audio.put_latest((time.monotonic(), bytes(data)), discontinuity=bool(status))
     def recognizer(words):
         return Recognizer(model, rate, json.dumps(words, ensure_ascii=False))
     wake = recognizer(['михаил', 'михаил борисович', '[unk]'])
@@ -394,6 +441,8 @@ def listen(cfg, duration=0, check_mode=None):
     preroll = deque(maxlen=3)
     began = time.monotonic()
     last_audio = began
+    drop_counts = {'overflow': 0, 'stale': 0}
+    next_audio_report = began
     try:
         try:
             sd.check_input_settings(device=cfg['input_device'], channels=1, dtype='int16', samplerate=rate)
@@ -406,21 +455,34 @@ def listen(cfg, duration=0, check_mode=None):
             else:
                 speech.say('Михаил Борисович готов. Скажите Михаил.', remember=False)
             while not duration or time.monotonic() - began < duration:
+                if output_lost.is_set():
+                    raise BrokenPipeError('Output channel closed')
                 if not stream.active:
                     raise RuntimeError('Микрофон отключился.')
                 if not issues.empty():
                     log('ERROR', issues.get_nowait())
+                drop_counts['overflow'] += audio.take_dropped()
+                if time.monotonic() >= next_audio_report and any(drop_counts.values()):
+                    log('AUDIO', f"Discarded frames: overflow={drop_counts['overflow']}, stale={drop_counts['stale']}")
+                    drop_counts = {'overflow': 0, 'stale': 0}
+                    next_audio_report = time.monotonic() + 2
                 if gpt.active:
                     try:
-                        captured, data = audio.get(timeout=.2)
+                        captured, data, discontinuity = audio.get(timeout=.2)
                     except queue.Empty:
+                        gpt.tick(time.monotonic())
                         if time.monotonic() - last_audio > 3:
                             raise RuntimeError('Микрофон не передает звук более трех секунд.')
-                        continue
-                    last_audio = time.monotonic()
-                    gpt.step(data, captured)
+                    else:
+                        last_audio = time.monotonic()
+                        if discontinuity:
+                            gpt.audio_gap(captured, discard_through=False)
+                        if not 0 <= last_audio - captured <= .4:
+                            drop_counts['stale'] += 1
+                        gpt.step(data, captured)
                     if not gpt.active:
-                        guard.close()
+                        if guard.close() is False:
+                            raise RuntimeError('Speaker monitor shutdown not confirmed; replacement blocked.')
                         guard = OutputGuard(cfg)
                         gpt.guard = guard
                         state = 'waiting'
@@ -451,12 +513,21 @@ def listen(cfg, duration=0, check_mode=None):
                     speech.say('Не услышал команду.', remember=False)
                     state, next_state = 'speaking', 'waiting'
                 try:
-                    captured, data = audio.get(timeout=0.2)
+                    captured, data, discontinuity = audio.get(timeout=0.2)
                 except queue.Empty:
                     if time.monotonic() - last_audio > 3:
                         raise RuntimeError('Микрофон не передает звук более трех секунд.')
                     continue
                 last_audio = time.monotonic()
+                stale = not 0 <= last_audio - captured <= .4
+                if discontinuity or stale:
+                    wake.Reset()
+                    commands.Reset()
+                    preroll.clear()
+                    tail = 0
+                if stale:
+                    drop_counts['stale'] += 1
+                    continue
                 if state in ('speaking', 'cooldown', 'chatgpt_busy') or captured <= accept_after:
                     continue
                 if state == 'waiting':
@@ -500,9 +571,13 @@ def listen(cfg, duration=0, check_mode=None):
                         speech.say(answer, remember=answer not in (UNKNOWN, 'Не понял. Возвращаюсь в режим ожидания.'))
                     state = 'speaking'
     finally:
-        bridge.close()
-        guard.close()
-        speech.close()
+        try:
+            bridge.close()
+        finally:
+            try:
+                guard.close()
+            finally:
+                speech.close()
 
 
 def main():
@@ -521,10 +596,14 @@ def main():
             log('WAITING', f'Проверка завершена; средний CPU {cpu:.1f}% одного ядра; пиковая RAM {usage.ru_maxrss / 1024:.0f} МиБ (включая загрузку модели).')
         return 0
     except KeyboardInterrupt:
-        log('WAITING', 'Ассистент остановлен.')
+        cleanup_log('[WAITING] Ассистент остановлен.', flush=True)
         return 0
+    except BrokenPipeError:
+        silence_broken_stream(sys.stdout)
+        silence_broken_stream(sys.stderr)
+        return 1
     except Exception as exc:
-        log('ERROR', f'{exc}')
+        cleanup_log(f'[ERROR] {exc}', flush=True)
         return 1
 
 

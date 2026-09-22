@@ -31,6 +31,15 @@ class GPTModes:
         self.last_sound = 0
         self.mic_tail = 0
         self.preroll = deque(maxlen=3)
+        self.emergency = False
+        self.closed_confirmed = False
+        self.blocked_since = None
+        self.control_tick = None
+        self.control_allowed = False
+        self.control_wait_started = None
+        self.job_started = None
+        self.job_warned = False
+        self.last_transition = None
 
     @property
     def active(self):
@@ -46,6 +55,8 @@ class GPTModes:
         self.accept_after = float('inf')
 
     def start(self, mode):
+        self.emergency = self.closed_confirmed = False
+        self.blocked_since = self.control_tick = None
         self.target_mode = mode
         self.say('Зову Ларису.' if mode == LARISA_MODE else 'Зову Антона Павловича.',
                  'open' if mode == LARISA_MODE else 'open_anton', time.monotonic())
@@ -54,6 +65,8 @@ class GPTModes:
         assert self.job is None
         self.action = action
         self.job = self.bridge.submit(action)
+        self.job_started = None
+        self.job_warned = False
         if phase:
             self.phase = phase
 
@@ -68,6 +81,8 @@ class GPTModes:
         elif action == 'control':
             self.phase = 'control'
             self.deadline = now + self.cfg['command_timeout']
+            self.control_tick = now
+            self.control_allowed = True
         elif action == 'next_chunk':
             if self.chunks:
                 self.say(self.chunks.pop(0), 'next_chunk', now)
@@ -90,6 +105,7 @@ class GPTModes:
         if action != 'poll':
             print(f'[GPT] {result["detail"]}', flush=True)
         if action == 'close':
+            self.closed_confirmed = True
             self.mode = LOCAL_MODE
             self.interrupt = False
             print(f'[{LOCAL_MODE}]', flush=True)
@@ -143,34 +159,128 @@ class GPTModes:
             elif self.phase == 'voice' and not result.get('end_voice'):
                 self.fail('Интерфейс Voice завершился или отключился.', now)
 
-    def step(self, pcm, captured, now=None):
+    def audio_gap(self, now, *, discard_through=True):
+        """Forget recognizer context across a dropped callback block."""
+        self.rec.Reset()
+        self.preroll.clear()
+        self.mic_tail = 0
+        if discard_through:
+            self.accept_after = max(self.accept_after, now)
+
+    def tick(self, now=None):
+        """Service jobs and deadlines even when audio is blocked or absent."""
         now = time.monotonic() if now is None else now
         if not self.active:
             return
-        self.guard.start()
-        if self.phase == 'speaking':
-            if not self.speech.busy():
-                self.phase = 'cooldown'
-                self.deadline = now + max(.8, self.cfg.get('tts_cooldown_ms', 500)/1000)
-            return
-        if self.phase == 'cooldown':
-            if now >= self.deadline and self.guard.allows(now):
-                self.accept_after = now
-                self.rec.Reset()
-                self.after(self.after_speech, now)
-            return
+        transition = (self.mode, self.phase)
+        if transition != self.last_transition:
+            print(f'[GPT STATE] {self.mode}/{self.phase}', flush=True)
+            self.last_transition = transition
+        # Keep servicing the guard even without admissible microphone frames.
+        silent = False if self.closed_confirmed else self.guard.allows(now)
+        if not self.closed_confirmed:
+            if silent or self.guard.available(now):
+                self.blocked_since = None
+            elif self.blocked_since is None:
+                self.blocked_since = now
+            prolonged = (self.blocked_since is not None and
+                         now - self.blocked_since >= self.cfg.get('speaker_block_timeout', 60))
+            if getattr(self.guard, 'failed', False) is True or prolonged:
+                if not self.emergency:
+                    print('[GPT ERROR] Speaker protection unavailable too long; closing GPT.', flush=True)
+                self.emergency = True
+                self.interrupt = False
+                self.chunks.clear()
+        waiting_for_control = (self.phase == 'control' or
+                               (self.phase in ('speaking', 'cooldown') and
+                                self.after_speech == 'control'))
+        if waiting_for_control:
+            if self.control_wait_started is None:
+                self.control_wait_started = now
+            if now - self.control_wait_started >= (self.cfg['command_timeout'] +
+                                                    self.cfg.get('speaker_block_timeout', 60)):
+                if not self.emergency:
+                    print('[GPT ERROR] Return-command recovery window expired; closing GPT.', flush=True)
+                self.emergency = True
+        else:
+            self.control_wait_started = None
+        if self.job is not None:
+            if self.job_started is None:
+                self.job_started = now
+            if now - self.job_started >= self.cfg.get('gpt_job_timeout', 90):
+                self.emergency = True
+                if not self.job_warned:
+                    print('[GPT ERROR] UI job timed out; independent browser shutdown requested.', flush=True)
+                    self.job_warned = True
+        if self.phase in ('transcribing', 'reply') and now >= self.deadline:
+            # Check the operation deadline before consuming a late poll result.
+            # Otherwise a delayed transcription could still trigger Send.
+            if not self.emergency:
+                print('[GPT ERROR] Transcription/reply deadline expired; closing GPT.', flush=True)
+            self.emergency = True
         if self.job is not None and self.job.done():
             job, action = self.job, self.action
             self.job = None
             try:
                 result = job.result()
             except Exception as exc:
-                result = {'ok': False, 'detail': str(exc)}
-            self.completed(result, action, now)
-            if self.phase in ('speaking', 'idle'):
+                result = {'ok': False, 'detail': type(exc).__name__}
+            # Drain the Future, but never turn an emergency poll result into Send.
+            if action == 'close' or not self.emergency:
+                self.completed(result, action, now)
+            if self.phase == 'speaking':
                 return
-        if captured <= self.accept_after or now - captured > .4:
+        if self.emergency and not self.closed_confirmed:
+            if self.job is not None and self.action != 'close':
+                if self.action == 'send':
+                    print('[GPT ERROR] Send outcome is unknown; no automatic retry.', flush=True)
+                # Bridge keeps the interrupted Future pending until the owned
+                # worker is dead. Closing uses its independent supervisor.
+                self.job = None
+            if self.job is None and self.phase != 'error_wait':
+                self.submit('close', 'closing')
+            return
+        if self.phase == 'speaking' and not self.speech.busy():
+            self.phase = 'cooldown'
+            self.deadline = now + max(.8, self.cfg.get('tts_cooldown_ms', 500) / 1000)
+            return
+        # Once browser closure is confirmed only our own TTS and its echo remain.
+        if self.phase == 'cooldown' and now >= self.deadline and (self.closed_confirmed or silent):
+            self.accept_after = now
             self.rec.Reset()
+            self.after(self.after_speech, now)
+            return
+        if self.phase == 'control':
+            if self.control_tick is not None and not (silent and self.control_allowed):
+                self.deadline += max(0, now - self.control_tick)
+            self.control_tick, self.control_allowed = now, silent
+        if self.phase == 'control' and now >= self.deadline:
+            if self.mode == ANTON_MODE and self.resume_phase in ('reply', 'transcribing'):
+                self.phase = self.resume_phase
+                self.deadline = now + self.cfg.get('reply_timeout', 180)
+            else:
+                self.after('resume' if self.mode == LARISA_MODE else 'dictate', now)
+        if self.job is None and self.phase == 'dictating' and now >= self.deadline:
+            if self.heard:
+                self.submit('transcribe', 'stopping_dictation')
+            else:
+                self.fail('Не обнаружена речь во время диктовки.', now)
+        if self.job is None and self.phase in ('transcribing', 'reply', 'voice'):
+            if self.phase != 'voice' and now >= self.deadline:
+                self.fail('Истекло время ожидания транскрипции или ответа.', now)
+            elif now >= self.poll_after:
+                self.poll_after = now + 1
+                self.submit('poll')
+
+    def step(self, pcm, captured, now=None):
+        now = time.monotonic() if now is None else now
+        if not self.active:
+            return
+        self.tick(now)
+        if self.emergency or self.phase in ('speaking', 'cooldown', 'idle', 'closing'):
+            return
+        if captured <= self.accept_after or not 0 <= now - captured <= .4:
+            self.audio_gap(captured)
             return
         silent = self.guard.allows(now)
         if not silent:
@@ -201,13 +311,6 @@ class GPTModes:
             if final and text in RETURNS:
                 self.submit('close', 'closing')
                 return
-            if now >= self.deadline:
-                if self.mode == ANTON_MODE and self.resume_phase in ('reply','transcribing'):
-                    self.phase = self.resume_phase
-                    self.deadline = now + self.cfg.get('reply_timeout', 180)
-                else:
-                    self.after('resume' if self.mode == LARISA_MODE else 'dictate', now)
-                return
         elif text == 'михаил борисович' and self.phase not in ('closing','pausing'):
             self.rec.Reset()
             self.resume_phase = self.phase
@@ -231,9 +334,3 @@ class GPTModes:
                 self.submit('transcribe', 'stopping_dictation')
             elif now >= self.deadline:
                 self.fail('Не обнаружена речь во время диктовки.', now)
-        elif self.phase in ('transcribing','reply','voice'):
-            if self.phase != 'voice' and now >= self.deadline:
-                self.fail('Истекло время ожидания транскрипции или ответа.', now)
-            elif now >= self.poll_after:
-                self.poll_after = now + 1
-                self.submit('poll')

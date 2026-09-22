@@ -4,10 +4,60 @@ import os
 from pathlib import Path
 import tempfile
 import time
+import threading
 import unittest
 from urllib.parse import quote
 from chatgpt_ui import ChatGPTUI, UIError
 import main
+from chatgpt_bridge import Bridge
+from browser_worker import descendants
+
+
+class FixtureBrowserUI(ChatGPTUI):
+    """Real browser lifetime through Bridge, using only a local blank page."""
+    def open(self):
+        from selenium import webdriver
+        from selenium.webdriver.firefox.service import Service
+        opts = webdriver.FirefoxOptions()
+        opts.binary_location = self.cfg['firefox_binary']
+        for arg in ('-profile', self.cfg['firefox_profile'], '-no-remote'):
+            opts.add_argument(arg)
+        self.service = Service(self.cfg['geckodriver'], popen_kw={'start_new_session': True})
+        self.driver = webdriver.Firefox(options=opts, service=self.service)
+        self.driver.get('about:blank')
+        if self.cfg.get('fixture_hang_quit'):
+            # Hang the quit call itself with actual Firefox/geckodriver alive.
+            # The independent owner must clean them without another UI call.
+            self.driver.quit = threading.Event().wait
+
+    def poll(self):
+        return {'ok': True, 'detail': 'local fixture',
+                'pid': self.driver.capabilities['moz:processID']}
+
+
+@unittest.skipUnless(os.environ.get('MB_BROWSER_TEST') == '1', 'opt-in real Firefox fixture')
+class BrowserLifecycleTests(unittest.TestCase):
+    def test_bridge_closes_and_restarts_real_firefox(self):
+        cfg = main.config()
+        base = Path(cfg['firefox_profile']).expanduser().parent
+        with tempfile.TemporaryDirectory(prefix='mb-lifetime-test-', dir=base) as profile:
+            cfg['firefox_profile'] = profile
+            bridge = Bridge(cfg, ui_factory='test_browser_dom:FixtureBrowserUI')
+            try:
+                for hang_quit in (False, True):
+                    bridge.cfg['fixture_hang_quit'] = hang_quit
+                    self.assertTrue(bridge.submit('open_anton').result(timeout=60)['ok'])
+                    pid = bridge.submit('poll').result(timeout=15)['pid']
+                    self.assertTrue(Path(f'/proc/{pid}').exists())
+                    self.assertIn(pid, descendants(bridge.process.pid))
+                    result = bridge.close()
+                    self.assertTrue(result['ok'])
+                    if hang_quit:
+                        self.assertTrue(result['forced'])
+                    self.assertFalse(Path(f'/proc/{pid}').exists())
+                    self.assertFalse(bridge.thread.is_alive())
+            finally:
+                bridge.close()
 
 
 @unittest.skipUnless(os.environ.get('MB_BROWSER_TEST') == '1', 'opt-in real Firefox fixture')

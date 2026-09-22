@@ -4,8 +4,6 @@ No browser storage, private page state, network interception or ChatGPT APIs.
 """
 from pathlib import Path
 import time
-import os
-import signal
 import json
 import subprocess
 from urllib.parse import urlsplit
@@ -290,26 +288,13 @@ class ChatGPTUI:
         except Exception as exc:
             error = exc
         finally:
-            # geckodriver has its own process group, created by this instance.
-            # Clean up hung owned Firefox children even if WebDriver timed out.
+            # This is only the normal WebDriver path. The independent browser
+            # supervisor owns escalation and verifies/reaps the entire tree,
+            # including children created before the driver constructor returns.
             if self.service and self.service.process:
-                group = self.service.process.pid
-                try:
-                    os.killpg(group, signal.SIGTERM)
-                    until = time.monotonic() + 3
-                    while time.monotonic() < until:
-                        try:
-                            os.killpg(group, 0)
-                        except ProcessLookupError:
-                            break
-                        time.sleep(.1)
-                    else:
-                        os.killpg(group, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
                 self.service.stop()
             self.driver = None
             self.service = None
         if error:
-            print(f'[GPT] WebDriver quit: {type(error).__name__}; owned process group cleaned.', flush=True)
-        return {'ok': True, 'detail': 'Firefox GPT-сеанса завершён.'}
+            print(f'[GPT] WebDriver quit failed: {type(error).__name__}; supervisor must confirm cleanup.', flush=True)
+        return {'ok': error is None, 'detail': 'WebDriver close finished; process ownership is checked by supervisor.'}

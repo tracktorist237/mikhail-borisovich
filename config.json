@@ -14,6 +14,7 @@
   "dictation_silence_ms": 1400,
   "dictation_max_seconds": 45,
   "reply_timeout": 180,
+  "browser_close_timeout": 12,
   "dictation_stop_method": "os-keyboard",
   "firefox_profile": "~/snap/firefox/common/mb-profile",
   "firefox_binary": "/snap/firefox/current/usr/lib/firefox/firefox",

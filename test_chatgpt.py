@@ -4,6 +4,7 @@ from array import array
 from concurrent.futures import Future
 from unittest.mock import Mock, patch
 import main
+from main import FreshAudioQueue
 from chatgpt_bridge import Bridge, LOCAL_MODE, LARISA_MODE, ANTON_MODE
 from speaker_activity import Activity, OutputGuard
 from gpt_modes import GPTModes
@@ -15,6 +16,38 @@ def pcm(value=0):
 
 
 class ChatGPTTests(unittest.TestCase):
+    def test_audio_queue_keeps_fresh_frame_and_marks_gap(self):
+        audio = FreshAudioQueue(maxsize=2)
+        audio.put_latest((1, b'old-1'))
+        audio.put_latest((2, b'old-2'))
+        audio.put_latest((3, b'fresh'))
+        self.assertEqual(audio.take_dropped(), 1)
+        self.assertEqual(audio.get(timeout=0), (2, b'old-2', True))
+        self.assertEqual(audio.get(timeout=0), (3, b'fresh', False))
+
+    def test_audio_gap_resets_unfinished_recognition(self):
+        g = ModeTests().make(ANTON_MODE)
+        g.mic_tail = 12
+        g.preroll.append(b'partial')
+        g.audio_gap(10)
+        self.assertEqual(g.mic_tail, 0)
+        self.assertFalse(g.preroll)
+        g.rec.Reset.assert_called()
+
+    def test_blocked_guard_still_services_poll_timer(self):
+        g = ModeTests().make(ANTON_MODE)
+        g.phase = 'reply'
+        g.poll_after = 0
+        g.guard.allows.return_value = False
+        g.tick(1)
+        self.assertIn('poll', [call.args[0] for call in g.bridge.submit.call_args_list])
+
+    def test_permanent_guard_failure_closes_gpt(self):
+        g = ModeTests().make(ANTON_MODE)
+        g.guard.failed = True
+        g.tick(1)
+        self.assertIn('close', [call.args[0] for call in g.bridge.submit.call_args_list])
+
     def test_intents(self):
         for intent in ('CHATGPT_OPEN','CHATGPT_CLOSE','LARISA_OPEN','ANTON_OPEN'):
             for phrase in main.INTENTS[intent]:
@@ -57,17 +90,45 @@ class ChatGPTTests(unittest.TestCase):
         ui.click=Mock()
         ui.wait=Mock(side_effect=UIError('no active microphone'))
         with self.assertRaises(UIError):ui.start_voice()
-        bridge=Bridge()
-        bridge.ui=Mock()
-        bridge.ui.start_voice.side_effect=UIError('unavailable')
-        self.assertFalse(bridge.perform('open')['ok'])
-        bridge.close()
+        from browser_worker import perform
+        fake_ui=Mock()
+        fake_ui.start_voice.side_effect=UIError('unavailable')
+        self.assertFalse(perform(fake_ui, 'open')['ok'])
 
     def test_monitor_failure_is_closed(self):
         with patch('speaker_activity.subprocess.Popen',side_effect=OSError('unavailable')):
             guard=OutputGuard()
             self.assertFalse(guard.allows(0))
             guard.close()
+
+    def test_monitor_recovery_is_bounded(self):
+        with patch('speaker_activity.subprocess.Popen', side_effect=OSError('missing')) as popen:
+            guard = OutputGuard({'speaker_restart_limit': 2, 'speaker_restart_delay': 0})
+            guard.start = Mock()
+            for now in (0, 1, 2, 100):
+                guard._service(now)
+                self.assertFalse(guard.allows(now))
+            self.assertTrue(guard.failed)
+            self.assertEqual(popen.call_count, 2)
+            guard.close()
+
+    def test_monitor_recovers_after_eof(self):
+        from test_resilience import FakeProcess
+        first, second = FakeProcess(), FakeProcess()
+        self.addCleanup(first.cleanup)
+        self.addCleanup(second.cleanup)
+        first.eof()
+        with patch('speaker_activity.subprocess.Popen', side_effect=[first, second]) as popen:
+            guard = OutputGuard({'speaker_restart_limit': 3, 'speaker_restart_delay': 0})
+            guard.start = Mock()
+            self.addCleanup(lambda: guard._retire('test cleanup', 10))
+            guard._service(0)
+            guard._service(.1)
+            guard._service(1)
+            self.assertEqual(popen.call_count, 2)
+            second.write(pcm())
+            guard._service(1.1)
+            self.assertIsNotNone(guard.last_data)
 
 
 class ModeTests(unittest.TestCase):
