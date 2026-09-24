@@ -3,6 +3,7 @@
 import argparse
 from array import array
 from collections import deque
+from contextlib import ExitStack
 from datetime import datetime
 import json
 import math
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import NamedTuple
 
 from chatgpt_bridge import Bridge, OutputGuard, LOCAL_MODE, LARISA_MODE, ANTON_MODE
 from gpt_modes import GPTModes, CONTROL_GRAMMAR
@@ -72,6 +74,46 @@ class FreshAudioQueue:
             self.dropped = 0
             return count
 
+    def trim_wake(self, now, capture_now, boundary=None):
+        """Consumer only: discard the unusable prefix in one bounded pass.
+
+        No extra buffer or extended freshness window. While waiting for the
+        player, keep fresh PCM irrespective of its origin; only the recorded
+        playback boundary can later distinguish TTS from user audio.
+        """
+        def fresh(item):
+            arrived, capture, _ = item
+            return (isinstance(capture, CapturedPCM) and capture.start is not None
+                    and 0 <= now-arrived <= .4 and 0 <= capture_now-capture.start <= .4)
+
+        def post(item):
+            capture = item[1]
+            return (boundary is not None and isinstance(capture, CapturedPCM)
+                    and capture.start is not None and capture.start >= boundary)
+
+        def age(item):
+            capture = item[1]
+            return (round(capture_now-capture.start, 3)
+                    if isinstance(capture, CapturedPCM) and capture.start is not None else None)
+
+        with self.condition:
+            info = dict(depth=len(self.items), dropped=0, post_stale=0,
+                        last_arrival=self.items[-1][0] if self.items else None,
+                        first_age=age(self.items[0]) if self.items else None,
+                        last_age=age(self.items[-1]) if self.items else None)
+            while self.items:
+                item = self.items[0]
+                if fresh(item) and (boundary is None or post(item)):
+                    break
+                self.items.popleft()
+                info['dropped'] += 1
+                info['post_stale'] += int(post(item) and not fresh(item))
+                # Removing only a prefix preserves the existing gap contract:
+                # the next frame resets recognition before it is consumed.
+                self.pending_gap = True
+            info['pending'] = {id(item[1]) for item in self.items if post(item) and fresh(item)}
+            return info
+
 
 def log(state, message=''):
     print(f'[{state}] {message}', flush=True)
@@ -123,6 +165,66 @@ def voices():
     return result
 
 
+class CapturedPCM(NamedTuple):
+    pcm: bytes
+    start: float | None
+    end: float | None
+
+    @classmethod
+    def from_callback(cls, data, frames, rate, timing):
+        # ADC timestamps and stream.time share PortAudio's unspecified epoch.
+        # Never interpret them as Python monotonic timestamps or rebase them
+        # at callback delivery (which may be delayed by the scheduler).
+        try:
+            start = float(timing.inputBufferAdcTime)
+            end = start + frames / rate
+            current = float(timing.currentTime)
+            if not all(math.isfinite(x) for x in (start, end, current)) or end > current + 1 / rate:
+                start = end = None
+        except (AttributeError, TypeError, ValueError):
+            start = end = None
+        return cls(bytes(data), start, end)
+
+
+class PlaybackEnd:
+    """One blocking wait, one timestamp, one utterance. No polling worker.
+
+    Player exit after drain is the available completion confirmation, not a
+    DAC timestamp. Sampling the input stream clock immediately after wait()
+    gives a conservative boundary independent of the main-loop polling lag.
+    Scheduling lag of this waiter is not subtracted or guessed away.
+    """
+    def __init__(self, clock):
+        self.clock = clock
+        self.done = threading.Event()
+        self.boundary = None
+        self.status = None
+        self.error = None
+        self.thread = None
+
+    def start(self, process):
+        def completed():
+            try:
+                self.status = process.wait()
+                if self.status == 0:
+                    boundary = float(self.clock())
+                    if not math.isfinite(boundary):
+                        raise ValueError('Invalid playback clock')
+                    self.boundary = boundary
+            except Exception as exc:
+                self.error = type(exc).__name__
+            finally:
+                self.done.set()
+        self.thread = threading.Thread(target=completed, name='wake-playback-end', daemon=True)
+        self.thread.start()
+
+    def join(self):
+        if self.thread is not None:
+            self.thread.join(timeout=1)
+            if self.thread.is_alive():
+                raise RuntimeError('Не подтверждено завершение ожидания playback.')
+
+
 class Speech:
     def __init__(self, cfg):
         if not shutil.which('RHVoice-test'):
@@ -141,11 +243,13 @@ class Speech:
         self.path = str(Path(self.tmp.name) / 'speech.wav')
         self.process = None
         self.phase = None
+        self.completion = None
         self.last = 'Пока нечего повторять.'
         log('SPEAKING', f'Голос: {self.voice}; вывод: {self.player}')
 
-    def say(self, text, remember=True):
+    def say(self, text, remember=True, *, completion_clock=None):
         self.stop()
+        self.completion = PlaybackEnd(completion_clock) if completion_clock is not None else None
         if remember:
             self.last = text
         log('SPEAKING', text)
@@ -162,7 +266,16 @@ class Speech:
         if time.monotonic() - self.started > 30:
             self.stop()
             raise RuntimeError('Синтез речи или аудиовыход не отвечает.')
-        status = self.process.poll()
+        completion = getattr(self, 'completion', None)
+        if self.phase == 'playback' and completion is not None:
+            if not completion.done.is_set():
+                return True
+            if completion.error:
+                self.stop()
+                raise RuntimeError('Не удалось подтвердить границу окончания playback.')
+            status = completion.status
+        else:
+            status = self.process.poll()
         if status is None:
             return True
         if status:
@@ -173,9 +286,19 @@ class Speech:
         if self.phase == 'synthesis':
             self.process = subprocess.Popen([self.player, self.path], stdout=subprocess.DEVNULL, stderr=self.errors)
             self.phase = 'playback'
+            if completion is not None:
+                completion.start(self.process)
             return True
         self.stop()
         return False
+
+    @property
+    def playback_end(self):
+        return self.completion.boundary if self.completion is not None else None
+
+    def wait_for_completion(self, timeout):
+        if self.completion is not None:
+            self.completion.done.wait(timeout)
 
     def stop(self):
         if self.process:
@@ -188,6 +311,9 @@ class Speech:
                     self.process.wait()
             self.process = None
             self.errors.close()
+        completion = getattr(self, 'completion', None)
+        if completion is not None:
+            completion.join()
         self.phase = None
 
     def close(self):
@@ -333,6 +459,60 @@ def volume(text, cfg):
     return f'Громкость {value} процентов.'
 
 
+def ru_form(number, one, few, many):
+    """Russian noun form for an integer count."""
+    number = abs(number)
+    if 11 <= number % 100 <= 14:
+        return many
+    if number % 10 == 1:
+        return one
+    if 2 <= number % 10 <= 4:
+        return few
+    return many
+
+
+def battery_report(root=Path('/sys/class/power_supply')):
+    """Read every available battery; sysfs entries can disappear while queried."""
+    try:
+        entries = list(Path(root).iterdir())
+    except FileNotFoundError:
+        return 'Батарея не обнаружена.'
+    except OSError:
+        return 'Не удалось получить данные о заряде батареи.'
+    if not entries:
+        return 'Батарея не обнаружена.'
+
+    detected_battery = False
+    unreadable_type = False
+    parts = []
+    for entry in entries:
+        try:
+            supply_type = (entry / 'type').read_text().strip()
+        except OSError:
+            unreadable_type = True
+            continue
+        if supply_type != 'Battery':
+            continue
+        detected_battery = True
+        try:
+            level = (entry / 'capacity').read_text().strip()
+            status = (entry / 'status').read_text().strip()
+        except OSError:
+            continue
+        status_text = {
+            'Charging': 'Идет зарядка.',
+            'Discharging': 'Работа от батареи.',
+            'Full': 'Батарея заряжена.',
+        }.get(status, '')
+        parts.append(f'Заряд {level} процентов. ' + status_text)
+
+    if parts:
+        return ' '.join(parts)
+    if detected_battery or unreadable_type:
+        return 'Не удалось получить данные о заряде батареи.'
+    return 'Батарея не обнаружена.'
+
+
 def command(text, cfg, speech, intent=None, value=None):
     text = normalize(text)
     log('COMMAND', text)
@@ -345,7 +525,9 @@ def command(text, cfg, speech, intent=None, value=None):
         return None
     if intent == 'TIME':
         now = datetime.now()
-        return f'Сейчас {now.hour} часов {now.minute} минут.'
+        hours = ru_form(now.hour, 'час', 'часа', 'часов')
+        minutes = ru_form(now.minute, 'минута', 'минуты', 'минут')
+        return f'Сейчас {now.hour} {hours} {now.minute} {minutes}.'
     if intent == 'DATE':
         months = 'января февраля марта апреля мая июня июля августа сентября октября ноября декабря'.split()
         now = datetime.now()
@@ -369,15 +551,7 @@ def command(text, cfg, speech, intent=None, value=None):
     if intent == 'INTERNET':
         return 'Интернет доступен.' if internet() else 'Не удалось подтвердить доступ к интернету.'
     if intent == 'BATTERY':
-        batteries = [p for p in Path('/sys/class/power_supply').glob('*') if (p / 'type').read_text().strip() == 'Battery']
-        if not batteries:
-            return 'Батарея не обнаружена.'
-        parts = []
-        for p in batteries:
-            level = (p / 'capacity').read_text().strip()
-            status = (p / 'status').read_text().strip()
-            parts.append(f'Заряд {level} процентов. ' + {'Charging': 'Идет зарядка.', 'Discharging': 'Работа от батареи.', 'Full': 'Батарея заряжена.'}.get(status, ''))
-        return ' '.join(parts)
+        return battery_report()
     if intent == 'REPEAT':
         return speech.last
     return UNKNOWN
@@ -416,7 +590,8 @@ def listen(cfg, duration=0, check_mode=None):
     def callback(data, frames, timing, status):
         if status and issues.empty():
             issues.put_nowait(str(status))
-        audio.put_latest((time.monotonic(), bytes(data)), discontinuity=bool(status))
+        audio.put_latest((time.monotonic(), CapturedPCM.from_callback(data, frames, rate, timing)),
+                         discontinuity=bool(status))
     def recognizer(words):
         return Recognizer(model, rate, json.dumps(words, ensure_ascii=False))
     wake = recognizer(['михаил', 'михаил борисович', '[unk]'])
@@ -427,6 +602,23 @@ def listen(cfg, duration=0, check_mode=None):
     control = recognizer(CONTROL_GRAMMAR)
     gpt = GPTModes(cfg, speech, bridge, guard, control)
     accept_after = float('inf')
+    command_capture_after = None  # PortAudio clock, never compared to monotonic.
+    handoff = None
+    wake_trimmed = 0
+    wake_overflow_start = 0
+
+    def report_handoff():
+        nonlocal handoff
+        if handoff is not None:
+            log('LOCAL READY', f"boundary={handoff['boundary']:.3f} "
+                f"poll_lag={handoff['poll_lag']:.3f} "
+                f"depth={handoff['depth']} overflow={handoff['overflow']} "
+                f"expired_wait={wake_trimmed} dropped={handoff['dropped']} "
+                f"first_age={handoff['first_age']} last_age={handoff['last_age']} "
+                f"post_kept={handoff['kept']} post_stale={handoff['post_stale']} "
+                f"stale_after={handoff['stale_after']} result_stale={handoff['result_stale']} "
+                f"unconsumed={len(handoff['pending'])}")
+            handoff = None
 
     def clear_audio():
         while True:
@@ -436,6 +628,7 @@ def listen(cfg, duration=0, check_mode=None):
                 break
     state = 'speaking'
     next_state = 'waiting'
+    readiness = 'cooldown'
     deadline = 0
     tail = 0
     preroll = deque(maxlen=3)
@@ -449,7 +642,10 @@ def listen(cfg, duration=0, check_mode=None):
             stream = sd.RawInputStream(device=cfg['input_device'], samplerate=rate, blocksize=block, dtype='int16', channels=1, callback=callback)
         except Exception as exc:
             raise RuntimeError(f'Микрофон недоступен: {exc}. Запустите diagnose.py --devices.') from None
-        with stream:
+        with stream, ExitStack() as playback_cleanup:
+            # The exit waiter samples this stream's clock. Stop/join it before
+            # RawInputStream.__exit__ destroys the PortAudio stream handle.
+            playback_cleanup.callback(speech.stop)
             if check_mode:
                 gpt.start(check_mode)
             else:
@@ -459,6 +655,8 @@ def listen(cfg, duration=0, check_mode=None):
                     raise BrokenPipeError('Output channel closed')
                 if not stream.active:
                     raise RuntimeError('Микрофон отключился.')
+                if handoff is not None and (not handoff['pending'] or state != 'listening' or gpt.active):
+                    report_handoff()
                 if not issues.empty():
                     log('ERROR', issues.get_nowait())
                 drop_counts['overflow'] += audio.take_dropped()
@@ -475,6 +673,8 @@ def listen(cfg, duration=0, check_mode=None):
                             raise RuntimeError('Микрофон не передает звук более трех секунд.')
                     else:
                         last_audio = time.monotonic()
+                        if isinstance(data, CapturedPCM):
+                            data = data.pcm
                         if discontinuity:
                             gpt.audio_gap(captured, discard_through=False)
                         if not 0 <= last_audio - captured <= .4:
@@ -490,25 +690,53 @@ def listen(cfg, duration=0, check_mode=None):
                         commands.Reset()
                         clear_audio()
                         accept_after = time.monotonic()
+                        command_capture_after = None
                         tail = 0
                         preroll.clear()
                         log('WAITING')
                     continue
+                playback_ready = False
                 if state == 'speaking' and not speech.busy():
-                    # Даем затихнуть динамикам, отбрасываем акустическое эхо.
-                    state = 'cooldown'
-                    deadline = time.monotonic() + cfg.get('tts_cooldown_ms', 500) / 1000
-                    clear_audio()
-                if state == 'cooldown' and time.monotonic() >= deadline:
+                    if readiness == 'playback_end':
+                        # Exit was recorded independently of this later poll.
+                        boundary = speech.playback_end
+                        if not isinstance(boundary, (int, float)) or not math.isfinite(boundary):
+                            raise RuntimeError('Недостоверная граница окончания «Слушаю».')
+                        command_capture_after = boundary
+                        handoff = audio.trim_wake(time.monotonic(), stream.time, boundary)
+                        if handoff['last_arrival'] is not None:
+                            last_audio = max(last_audio, handoff['last_arrival'])
+                        handoff.update(boundary=boundary, poll_lag=stream.time-boundary,
+                                       kept=len(handoff['pending']), stale_after=0, result_stale=0,
+                                       overflow=audio.discontinuities-wake_overflow_start)
+                        accept_after = float('-inf')
+                        playback_ready = True
+                    else:
+                        state = 'cooldown'
+                        deadline = time.monotonic() + cfg.get('tts_cooldown_ms', 500) / 1000
+                        clear_audio()
+                if playback_ready or (state == 'cooldown' and time.monotonic() >= deadline):
                     state = next_state
                     wake.Reset()
                     commands.Reset()
-                    clear_audio()
-                    accept_after = time.monotonic()
+                    if not playback_ready:
+                        clear_audio()
+                        accept_after = time.monotonic()
+                        command_capture_after = None
+                    readiness = 'cooldown'
                     tail = 0
                     preroll.clear()
                     deadline = time.monotonic() + cfg['command_timeout']
                     log('LISTENING' if state == 'listening' else 'WAITING')
+                if state == 'speaking' and readiness == 'playback_end':
+                    # Drain only already-expired PCM while waiting. Fresh PCM
+                    # can belong to the user before this loop observes exit.
+                    trimmed = audio.trim_wake(time.monotonic(), stream.time)
+                    wake_trimmed += trimmed['dropped']
+                    if trimmed['last_arrival'] is not None:
+                        last_audio = max(last_audio, trimmed['last_arrival'])
+                    speech.wait_for_completion(.2)
+                    continue
                 if state == 'listening' and time.monotonic() > deadline:
                     speech.say('Не услышал команду.', remember=False)
                     state, next_state = 'speaking', 'waiting'
@@ -519,7 +747,16 @@ def listen(cfg, duration=0, check_mode=None):
                         raise RuntimeError('Микрофон не передает звук более трех секунд.')
                     continue
                 last_audio = time.monotonic()
+                capture = data if isinstance(data, CapturedPCM) else None
+                if capture is not None:
+                    data = capture.pcm
                 stale = not 0 <= last_audio - captured <= .4
+                if command_capture_after is not None and capture is not None and capture.start is not None:
+                    age = stream.time - capture.start
+                    stale = stale or not 0 <= age <= .4
+                if handoff is not None and capture is not None and id(capture) in handoff['pending']:
+                    handoff['pending'].remove(id(capture))
+                    handoff['stale_after'] += int(stale)
                 if discontinuity or stale:
                     wake.Reset()
                     commands.Reset()
@@ -530,6 +767,10 @@ def listen(cfg, duration=0, check_mode=None):
                     continue
                 if state in ('speaking', 'cooldown', 'chatgpt_busy') or captured <= accept_after:
                     continue
+                if command_capture_after is not None:
+                    if capture is None or capture.start is None or capture.start < command_capture_after:
+                        commands.Reset()
+                        continue  # Includes every block straddling the end.
                 if state == 'waiting':
                     samples = array('h', data)[::4]
                     rms = math.sqrt(sum(x*x for x in samples) / len(samples))
@@ -546,15 +787,35 @@ def listen(cfg, duration=0, check_mode=None):
                 rec = wake if state == 'waiting' else commands
                 final = rec.AcceptWaveform(data)
                 result = json.loads(rec.Result() if final else rec.PartialResult())
+                if state == 'listening' and command_capture_after is not None and (
+                        not 0 <= time.monotonic()-captured <= .4 or
+                        not 0 <= stream.time-capture.start <= .4):
+                    # Recognition itself may stall. Never execute its now-old
+                    # command or retain a partial result across that gap.
+                    commands.Reset()
+                    drop_counts['stale'] += 1
+                    if handoff is not None:
+                        handoff['result_stale'] += 1
+                    continue
                 text = result.get('text' if final else 'partial', '')
                 if state == 'waiting' and 'михаил' in text.split():
                     log('WAKE WORD', text)
-                    speech.say('Слушаю', remember=False)
+                    report_handoff()
+                    wake_trimmed = 0
+                    wake_overflow_start = audio.discontinuities
+                    speech.say('Слушаю', remember=False, completion_clock=lambda: stream.time)
                     session = CommandSession()
                     state, next_state = 'speaking', 'listening'
-                elif state == 'listening' and final and text:
+                    readiness = 'playback_end'
+                elif state == 'listening' and final:
                     try:
                         intent, _ = match_intent(text)
+                        diagnostic_intent = intent or match_intent(text, session.pending)[0]
+                        diagnostic_text = normalize(text)
+                        log('LOCAL ASR', f'final={json.dumps(diagnostic_text[:240], ensure_ascii=False)} '
+                            f'intent={diagnostic_intent or "NONE"}' + (' truncated=true' if len(diagnostic_text) > 240 else ''))
+                        if not text:
+                            continue  # Preserve empty-final behavior; no automatic retry.
                         if intent in ('CHATGPT_OPEN', 'LARISA_OPEN', 'ANTON_OPEN'):
                             gpt.start(ANTON_MODE if intent == 'ANTON_OPEN' else LARISA_MODE)
                             clear_audio()

@@ -15,8 +15,11 @@ class Commands(unittest.TestCase):
         self.speech = Mock(last='Предыдущий ответ')
 
     def test_readonly(self):
-        for text in ['который час', 'сколько времени', 'какая дата', 'какой заряд']:
+        for text in ['который час', 'сколько времени', 'какая дата']:
             self.assertTrue(main.command(text, self.cfg, self.speech))
+        with patch('main.battery_report', return_value='Заряд 50 процентов. Идет зарядка.'):
+            self.assertEqual(main.command('какой заряд', self.cfg, self.speech),
+                             'Заряд 50 процентов. Идет зарядка.')
         self.assertEqual(main.command('повтори', self.cfg, self.speech), 'Предыдущий ответ')
         self.assertIsNone(main.command('замолчи', self.cfg, self.speech))
         self.speech.stop.assert_called_once()
@@ -43,6 +46,66 @@ class Commands(unittest.TestCase):
     def test_missing_model(self):
         with self.assertRaisesRegex(RuntimeError, 'Нет модели'):
             main.load_model({'model_path': '/tmp/no-such-mb-model'}, Mock())
+
+
+class BatteryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='mb-sysfs-battery-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def battery(self, name, capacity='50', status='Discharging'):
+        entry = self.root / name
+        entry.mkdir()
+        (entry / 'type').write_text('Battery\n')
+        (entry / 'capacity').write_text(capacity + '\n')
+        (entry / 'status').write_text(status + '\n')
+        return entry
+
+    def fail_reads(self, failed, error):
+        original = Path.read_text
+        def read_text(path, *args, **kwargs):
+            if path in failed:
+                raise error
+            return original(path, *args, **kwargs)
+        return patch.object(Path, 'read_text', read_text)
+
+    def test_present_battery_reads_capacity_and_status(self):
+        self.battery('BAT1', '64', 'Charging')
+        self.assertEqual(main.battery_report(self.root), 'Заряд 64 процентов. Идет зарядка.')
+
+    def test_one_disappearing_entry_uses_another_battery(self):
+        first = self.battery('BAT1', '11', 'Full')
+        self.battery('BAT2', '72', 'Discharging')
+        with self.fail_reads({first / 'capacity'}, OSError(19, 'No such device')):
+            result = main.battery_report(self.root)
+        self.assertEqual(result, 'Заряд 72 процентов. Работа от батареи.')
+
+    def test_capacity_disappearing_after_battery_detection_is_handled(self):
+        entry = self.battery('BAT1')
+        with self.fail_reads({entry / 'capacity'}, OSError(19, 'No such device')):
+            result = main.battery_report(self.root)
+        self.assertEqual(result, 'Не удалось получить данные о заряде батареи.')
+
+    def test_unavailable_status_is_handled(self):
+        entry = self.battery('BAT1')
+        with self.fail_reads({entry / 'status'}, PermissionError(13, 'Permission denied')):
+            result = main.battery_report(self.root)
+        self.assertEqual(result, 'Не удалось получить данные о заряде батареи.')
+
+    def test_no_battery_is_reported(self):
+        self.assertEqual(main.battery_report(self.root), 'Батарея не обнаружена.')
+        (self.root / 'AC').mkdir()
+        (self.root / 'AC' / 'type').write_text('Mains\n')
+        self.assertEqual(main.battery_report(self.root), 'Батарея не обнаружена.')
+
+    def test_all_detected_batteries_unavailable_are_reported(self):
+        first = self.battery('BAT1')
+        second = self.battery('BAT2')
+        with self.fail_reads({first / 'capacity', second / 'status'},
+                             OSError(19, 'No such device')):
+            result = main.battery_report(self.root)
+        self.assertEqual(result, 'Не удалось получить данные о заряде батареи.')
 
 
 class IntentTests(unittest.TestCase):
@@ -89,8 +152,11 @@ class IntentTests(unittest.TestCase):
         clock = [0.0]
         speech = Mock(last='ответ')
         ends = [0.0]
-        def say(text, remember=True):
+        cooldown = [.5]
+        def say(text, remember=True, *, completion_clock=None):
             ends[0] = clock[0] + .3
+            cooldown[0] = 0 if text == 'Слушаю' else .5
+            speech.playback_end = 10000 + ends[0] if completion_clock else None
         speech.say.side_effect = say
         speech.busy.side_effect = lambda: clock[0] < ends[0]
         callbacks = []
@@ -99,6 +165,7 @@ class IntentTests(unittest.TestCase):
         class Rec:
             def __init__(self, model, rate, grammar):
                 self.wake = 'михаил' in json.loads(grammar)
+                self.wake_reported = False
             def Reset(self):
                 pass
             def AcceptWaveform(self, data):
@@ -107,7 +174,12 @@ class IntentTests(unittest.TestCase):
                 assert data != b'echo'
                 return True
             def Result(self):
-                return json.dumps({'text': 'михаил' if self.wake else next(command_texts, 'стоп')})
+                if self.wake:
+                    text = '' if self.wake_reported else 'михаил'
+                    self.wake_reported = True
+                else:
+                    text = next(command_texts, 'стоп')
+                return json.dumps({'text': text})
         class Stream:
             def __init__(self, **kwargs):
                 callbacks.append(kwargs['callback'])
@@ -116,10 +188,14 @@ class IntentTests(unittest.TestCase):
             def __exit__(self, *args):
                 pass
             @property
+            def time(self):
+                return 10000 + clock[0]
+            @property
             def active(self):
                 clock[0] += .1
-                echo = clock[0] <= ends[0] + .5
-                callbacks[0](b'echo' if echo else b'\xff\x7f' * 1600, 1600, None, None)
+                echo = clock[0] <= ends[0] + cooldown[0]
+                timing = Mock(inputBufferAdcTime=self.time-.1, currentTime=self.time)
+                callbacks[0](b'echo' if echo else b'\xff\x7f' * 1600, 1600, timing, None)
                 return True
         sd = Mock(RawInputStream=Stream)
         with patch('main.dependencies', return_value=(sd, Mock(), Rec)), \

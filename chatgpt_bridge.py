@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from browser_worker import Channel
+from browser_timing import STARTUP_ACTIONS, job_timeout
 from speaker_activity import OutputGuard
 
 LOCAL_MODE = 'LOCAL_MODE'
@@ -19,6 +20,7 @@ CHATGPT_MODE = LARISA_MODE  # compatibility name for v0.2 callers
 class Bridge:
     def __init__(self, cfg=None, *, ui_factory='chatgpt_ui:ChatGPTUI'):
         self.cfg = dict(cfg or {})
+        job_timeout(self.cfg, 'open')  # Validate before starting a controller.
         self.budget = self.cfg.get('browser_close_timeout', 12)
         if not .5 <= self.budget <= 60:
             raise ValueError('browser_close_timeout must be between .5 and 60 seconds')
@@ -122,7 +124,7 @@ class Bridge:
                 with self.lock:
                     pending = self.pending
                     if (pending is not None and self.close_future is None and
-                            time.monotonic() - pending[3] >= self.cfg.get('gpt_job_timeout', 90)):
+                            time.monotonic() - pending[3] >= job_timeout(self.cfg, pending[1])):
                         cleanup_log('[GPT ERROR] UI operation timed out; independent shutdown requested.', flush=True)
                         self._close_locked()
                     closing, deadline = self.close_future, self.close_deadline
@@ -130,7 +132,10 @@ class Bridge:
                     channel.send({'type': 'close', 'deadline': deadline})
                     close_sent = True
                 elif closing is None and pending is not None and pending[0] != sent:
-                    channel.send({'type': 'job', 'id': pending[0], 'action': pending[1]})
+                    request = {'type': 'job', 'id': pending[0], 'action': pending[1]}
+                    if pending[1] in STARTUP_ACTIONS:
+                        request['startup_deadline'] = pending[3] + job_timeout(self.cfg, pending[1])
+                    channel.send(request)
                     sent = pending[0]
                 for message in channel.pump(.02):
                     if message['type'] == 'result':

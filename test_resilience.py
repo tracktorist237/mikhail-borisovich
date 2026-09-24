@@ -63,6 +63,7 @@ class LocalAudioTests(unittest.TestCase):
         def say(text, **kwargs):
             if text == 'Слушаю':
                 stale[0] = True
+                speech.playback_end = 10000 + clock[0]
         speech.say.side_effect = say
         class Audio(main.FreshAudioQueue):
             def get(self, timeout=None):
@@ -84,9 +85,12 @@ class LocalAudioTests(unittest.TestCase):
             def __enter__(self): return self
             def __exit__(self, *args): pass
             @property
+            def time(self): return 10000 + clock[0]
+            @property
             def active(self):
                 clock[0] += .1
-                self.callback(pcm(1000), 1600, None, None)
+                timing = Mock(inputBufferAdcTime=self.time-.1, currentTime=self.time)
+                self.callback(pcm(1000), 1600, timing, None)
                 return True
         with patch('main.dependencies', return_value=(Mock(RawInputStream=Stream), Mock(), Rec)), \
                 patch('main.load_model'), patch('main.Speech', return_value=speech), \

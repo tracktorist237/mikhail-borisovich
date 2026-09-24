@@ -295,30 +295,39 @@ class AudioLoopIntegrationTests(unittest.TestCase):
         clock = [0.0]
         ends = [0.0]
         speech = Mock(last='ответ')
-        def say(text, remember=True):
+        def say(text, remember=True, *, completion_clock=None):
             ends[0] = clock[0] + .3
+            speech.playback_end = 10000 + ends[0] if completion_clock else None
         speech.say.side_effect = say
         speech.busy.side_effect = lambda: clock[0] < ends[0]
         controls = iter(['громче', 'стоп', 'вернись', 'михаил борисович', 'вернись'])
+        modes = []
+        class ObservedModes(GPTModes):
+            def __init__(self, *args):
+                super().__init__(*args)
+                modes.append(self)
         class Rec:
             def __init__(self, model, rate, grammar):
                 words = json.loads(grammar)
-                self.kind = 'wake' if 'михаил' in words else ('control' if len(words) < 10 else 'command')
+                self.kind = 'wake' if 'михаил' in words else ('control' if words == main.CONTROL_GRAMMAR else 'command')
             def Reset(self):
                 pass
             def AcceptWaveform(self, data):
                 return True
             def Result(self):
-                return json.dumps({'text': {'wake': 'михаил', 'command': 'позови чат ж п т'}.get(self.kind, next(controls, 'тишина') if self.kind == 'control' else '')})
+                return json.dumps({'text': {'wake': 'михаил', 'command': 'позови чат ж п т'}.get(self.kind, next(controls, 'тишина') if self.kind == 'control' and modes[0].phase in ('voice', 'control') else '')})
         class Stream:
             def __init__(self, **kwargs):
                 self.callback = kwargs['callback']
             def __enter__(self): return self
             def __exit__(self, *args): pass
             @property
+            def time(self): return 10000 + clock[0]
+            @property
             def active(self):
                 clock[0] += .1
-                self.callback(b'\xff\x7f' * 1600, 1600, None, None)
+                timing = Mock(inputBufferAdcTime=self.time-.1, currentTime=self.time)
+                self.callback(b'\xff\x7f' * 1600, 1600, timing, None)
                 return True
         bridge = Mock()
         def submit(action):
@@ -327,7 +336,7 @@ class AudioLoopIntegrationTests(unittest.TestCase):
                 assert clock[0] >= ends[0] + .5
             future = Future(); future.set_result({'ok': close_ok if action == 'close' else True, 'detail': action, 'end_voice': True}); return future
         bridge.submit.side_effect = submit
-        with patch('main.dependencies', return_value=(Mock(RawInputStream=Stream), Mock(), Rec)), patch('main.load_model'), patch('main.Speech', return_value=speech), patch('main.Bridge', return_value=bridge), patch('main.OutputGuard') as guard, patch('main.time.monotonic', side_effect=lambda: clock[0]), patch('main.command') as command:
+        with patch('main.dependencies', return_value=(Mock(RawInputStream=Stream), Mock(), Rec)), patch('main.load_model'), patch('main.GPTModes', ObservedModes), patch('main.Speech', return_value=speech), patch('main.Bridge', return_value=bridge), patch('main.OutputGuard') as guard, patch('main.time.monotonic', side_effect=lambda: clock[0]), patch('main.command') as command:
             guard.return_value.allows.return_value = True
             guard.return_value.quiet.return_value = True
             main.listen(main.config(), duration=9)

@@ -5,6 +5,7 @@ Its subreaper boundary also owns children orphaned during driver construction,
 including descendants which create their own sessions/process groups.
 """
 from diagnostics import cleanup_log, ui_failure
+from contextlib import nullcontext
 import ctypes
 import importlib
 import json
@@ -56,13 +57,15 @@ class Channel:
         return messages
 
 
-def perform(ui, action):
+def perform(ui, action, startup_deadline=None):
     try:
-        if action == 'open':
-            return ui.start_voice()
-        if action == 'open_anton':
-            ui.open()
-            return {'ok': True, 'detail': 'Текстовый ChatGPT готов.'}
+        if action in ('open', 'open_anton'):
+            startup = getattr(type(ui), 'startup', None)
+            with startup(ui, startup_deadline) if startup else nullcontext():
+                if action == 'open':
+                    return ui.start_voice()
+                ui.open()
+                return {'ok': True, 'detail': 'Текстовый ChatGPT готов.'}
         method = {'close': 'close', 'pause': 'pause', 'abort_dictation': 'abort_dictation',
                   'resume': 'resume_voice', 'dictate': 'start_dictation',
                   'transcribe': 'stop_dictation', 'send': 'send', 'poll': 'poll'}[action]
@@ -82,7 +85,7 @@ def ui_worker(sock, cfg, factory):
     ui = getattr(importlib.import_module(module), name)(cfg)
     for line in reader:
         request = json.loads(line)
-        result = perform(ui, request['action'])
+        result = perform(ui, request['action'], request.get('startup_deadline'))
         sock.sendall(json.dumps({'id': request['id'], 'result': result}, ensure_ascii=False).encode() + b'\n')
         if request['action'] == 'close':
             return

@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "clips": [
+    {
+      "id": "wake-01",
+      "wav": "wav/wake-01.wav",
+      "expected": {
+        "transcript": "михаил",
+        "wake": true
+      },
+      "tags": [
+        "normal"
+      ]
+    },
+    {
+      "id": "time-01",
+      "wav": "wav/time-01.wav",
+      "expected": {
+        "transcript": "который час",
+        "intent": "TIME"
+      },
+      "tags": [
+        "normal",
+        "local"
+      ]
+    },
+    {
+      "id": "anton-01",
+      "wav": "wav/anton-01.wav",
+      "expected": {
+        "transcript": "позови антона павловича",
+        "intent": "ANTON_OPEN"
+      },
+      "tags": [
+        "normal",
+        "local"
+      ]
+    },
+    {
+      "id": "larisa-01",
+      "wav": "wav/larisa-01.wav",
+      "expected": {
+        "transcript": "позови ларису",
+        "intent": "LARISA_OPEN"
+      },
+      "tags": [
+        "normal",
+        "local"
+      ]
+    },
+    {
+      "id": "return-wake-01",
+      "wav": "wav/return-wake-01.wav",
+      "expected": {
+        "transcript": "михаил борисович",
+        "control": "WAKE"
+      },
+      "control_phase": "voice",
+      "tags": [
+        "control"
+      ]
+    },
+    {
+      "id": "return-command-01",
+      "wav": "wav/return-command-01.wav",
+      "expected": {
+        "transcript": "вернись",
+        "control": "RETURN"
+      },
+      "control_phase": "control",
+      "tags": [
+        "control"
+      ]
+    },
+    {
+      "id": "atomic-return-01",
+      "wav": "wav/atomic-return-01.wav",
+      "expected": {
+        "transcript": "михаил вернись",
+        "control": "ATOMIC_RETURN"
+      },
+      "control_phase": "opening",
+      "tags": [
+        "control"
+      ]
+    }
+  ]
+}

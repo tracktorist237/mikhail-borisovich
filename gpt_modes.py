@@ -1,4 +1,5 @@
 """Isolated GPT conversation state machine, driven by the existing audio loop."""
+from browser_timing import job_timeout
 from array import array
 from collections import deque
 import json
@@ -7,11 +8,30 @@ import re
 import time
 from chatgpt_bridge import LOCAL_MODE, LARISA_MODE, ANTON_MODE
 
-CONTROL_GRAMMAR = ['михаил борисович', 'вернись', 'закрой ларису',
+CONTROL_GRAMMAR = ['михаил вернись', 'михаил борисович вернись',
+                   'михаил борисович', 'вернись', 'закрой ларису',
                    'закрой антона павловича', 'закончи разговор', 'стоп',
                    'закрой чат ж п т', 'верни михаила', '[unk]']
 RETURNS = {'вернись', 'закрой ларису', 'закрой антона павловича',
            'закончи разговор', 'стоп', 'закрой чат ж п т', 'верни михаила'}
+ATOMIC_RETURNS = {'михаил вернись', 'михаил борисович вернись'}
+
+
+def normalize_control(text):
+    return ' '.join(re.sub(r'[^а-яёa-z0-9\s]', ' ', text.lower()).split())
+
+
+def classify_control(text, *, final, phase):
+    # Wait for endpoint: a partial full wake is also the prefix of the long
+    # atomic phrase. Pausing/TTS on that partial would swallow its continuation.
+    if not final:
+        return None
+    text = normalize_control(text)
+    if text in ATOMIC_RETURNS:
+        return 'ATOMIC_RETURN'
+    if phase == 'control':
+        return 'RETURN' if text in RETURNS else None
+    return 'WAKE' if text == 'михаил борисович' else None
 
 
 class GPTModes:
@@ -55,6 +75,8 @@ class GPTModes:
         self.accept_after = float('inf')
 
     def start(self, mode):
+        if self.active:
+            raise RuntimeError('Previous GPT session has not completed cleanup and TTS.')
         self.emergency = self.closed_confirmed = False
         self.blocked_since = self.control_tick = None
         self.target_mode = mode
@@ -207,7 +229,7 @@ class GPTModes:
         if self.job is not None:
             if self.job_started is None:
                 self.job_started = now
-            if now - self.job_started >= self.cfg.get('gpt_job_timeout', 90):
+            if now - self.job_started >= job_timeout(self.cfg, self.action):
                 self.emergency = True
                 if not self.job_warned:
                     print('[GPT ERROR] UI job timed out; independent browser shutdown requested.', flush=True)
@@ -272,11 +294,7 @@ class GPTModes:
                 self.poll_after = now + 1
                 self.submit('poll')
 
-    def step(self, pcm, captured, now=None):
-        now = time.monotonic() if now is None else now
-        if not self.active:
-            return
-        self.tick(now)
+    def _control_audio(self, pcm, captured, now):
         if self.emergency or self.phase in ('speaking', 'cooldown', 'idle', 'closing'):
             return
         if captured <= self.accept_after or not 0 <= now - captured <= .4:
@@ -306,12 +324,39 @@ class GPTModes:
         if self.mic_tail:
             final = self.rec.AcceptWaveform(rec_pcm)
             result = json.loads(self.rec.Result() if final else self.rec.PartialResult())
-            text = result.get('text' if final else 'partial', '').strip().lower()
+            text = result.get('text' if final else 'partial', '')
+        return rms, final, text
+
+    def step(self, pcm, captured, now=None):
+        live_clock = now is None
+        now = time.monotonic() if now is None else now
+        if not self.active:
+            return
+        # Read admissible control audio before consuming a ready UI Future.
+        # In particular, cancel must beat a late open or a poll that would Send.
+        audio = self._control_audio(pcm, captured, now)
+        if live_clock:
+            now = time.monotonic()
+        if audio is not None and (not 0 <= now - captured <= .4 or not self.guard.allows(now)):
+            self.audio_gap(now)
+            audio = None
+        if audio is not None and classify_control(audio[2], final=audio[1], phase=self.phase) == 'ATOMIC_RETURN':
+            self.emergency = True
+            self.interrupt = False
+            self.chunks.clear()
+            print('[GPT CONTROL] Atomic return; independent shutdown requested.', flush=True)
+        self.tick(now)  # Timers/recovery still run when no audio is admissible.
+        if (audio is None or self.emergency or
+                self.phase in ('speaking', 'cooldown', 'idle', 'closing') or
+                captured <= self.accept_after):
+            return
+        rms, final, text = audio
+        control = classify_control(text, final=final, phase=self.phase)
         if self.phase == 'control':
-            if final and text in RETURNS:
+            if control == 'RETURN':
                 self.submit('close', 'closing')
                 return
-        elif text == 'михаил борисович' and self.phase not in ('closing','pausing'):
+        elif control == 'WAKE' and self.phase not in ('closing','pausing'):
             self.rec.Reset()
             self.resume_phase = self.phase
             self.chunks = []

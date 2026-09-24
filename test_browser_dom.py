@@ -11,6 +11,7 @@ from chatgpt_ui import ChatGPTUI, UIError
 import main
 from chatgpt_bridge import Bridge
 from browser_worker import descendants
+from browser_timing import job_timeout
 
 
 class FixtureBrowserUI(ChatGPTUI):
@@ -23,8 +24,12 @@ class FixtureBrowserUI(ChatGPTUI):
         for arg in ('-profile', self.cfg['firefox_profile'], '-no-remote'):
             opts.add_argument(arg)
         self.service = Service(self.cfg['geckodriver'], popen_kw={'start_new_session': True})
+        started = time.monotonic()
+        print('[FIXTURE START] browser waiting', flush=True)
         self.driver = webdriver.Firefox(options=opts, service=self.service)
+        print(f'[FIXTURE START] browser ready elapsed={time.monotonic()-started:.1f}s', flush=True)
         self.driver.get('about:blank')
+        print(f'[FIXTURE START] local page ready elapsed={time.monotonic()-started:.1f}s', flush=True)
         if self.cfg.get('fixture_hang_quit'):
             # Hang the quit call itself with actual Firefox/geckodriver alive.
             # The independent owner must clean them without another UI call.
@@ -46,7 +51,8 @@ class BrowserLifecycleTests(unittest.TestCase):
             try:
                 for hang_quit in (False, True):
                     bridge.cfg['fixture_hang_quit'] = hang_quit
-                    self.assertTrue(bridge.submit('open_anton').result(timeout=60)['ok'])
+                    self.assertTrue(bridge.submit('open_anton').result(
+                        timeout=job_timeout(cfg, 'open_anton') + bridge.budget + 1)['ok'])
                     pid = bridge.submit('poll').result(timeout=15)['pid']
                     self.assertTrue(Path(f'/proc/{pid}').exists())
                     self.assertIn(pid, descendants(bridge.process.pid))
@@ -115,6 +121,42 @@ class BrowserDOMTests(unittest.TestCase):
             '<button aria-label="Stop dictation">Duplicate</button></main>')))
         with self.assertRaises(UIError):
             self.ui.stop_dictation()
+
+    def test_voice_ready_click_visible_unique_control(self):
+        html = '''<main>
+            <button aria-label="Start Voice" hidden onclick="this.textContent='wrong'">hidden</button>
+            <button aria-label="Start Voice" disabled>disabled</button>
+            <button id="voice" aria-label="Start Voice" onclick="this.textContent='started'">Voice</button>
+            </main>'''
+        self.ui.driver.get('data:text/html;charset=utf-8,' + quote(html))
+        with self.ui.startup():
+            self.ui.click_voice_when_ready()
+        self.assertEqual(self.ui.driver.find_element('id', 'voice').text, 'started')
+        html = html.replace('</main>', '<button aria-label="Start Voice">duplicate</button></main>')
+        self.ui.driver.get('data:text/html;charset=utf-8,' + quote(html))
+        with self.ui.startup(), self.assertRaises(UIError):
+            self.ui.click_voice_when_ready()
+        self.assertEqual(self.ui.driver.find_element('id', 'voice').text, 'Voice')
+
+    def test_microphone_rendered_controls_one_click_and_ambiguity(self):
+        html = """<main><button aria-label="End Voice">End</button>
+            <button aria-label="Turn on microphone" hidden>hidden</button>
+            <button aria-label="Turn off microphone" aria-disabled="true">disabled</button>
+            <button id="mic" aria-label="Turn on microphone" data-clicks="0"
+                onclick="this.dataset.clicks=String(+this.dataset.clicks+1); this.setAttribute('aria-label','Turn off microphone')">Mic</button>
+            </main>"""
+        self.ui.driver.get('data:text/html;charset=utf-8,' + quote(html))
+        state = self.ui.voice_microphone_state()
+        self.assertEqual((state['on_visible'], state['on_enabled'], state['off_enabled']), (1, 0, 1))
+        with self.ui.startup():
+            self.ui.wait_voice_microphone()
+        mic = self.ui.driver.find_element('id', 'mic')
+        self.assertEqual(mic.get_attribute('data-clicks'), '1')
+        self.assertEqual(self.ui.voice_microphone_state()['on_enabled'], 1)
+        self.ui.driver.execute_script("document.querySelector('main').insertAdjacentHTML('beforeend', '<button aria-label=\"Turn on microphone\">duplicate</button>')")
+        with self.ui.startup(), self.assertRaisesRegex(UIError, 'ambiguous'):
+            self.ui.wait_voice_microphone()
+        self.assertEqual(mic.get_attribute('data-clicks'), '1')
 
     def test_embedded_javascript_compiles(self):
         tree=ast.parse(Path('chatgpt_ui.py').read_text())
