@@ -148,7 +148,7 @@ def load_corpus(path):
         raise CorpusError('clips must be a nonempty list.')
     ids, hashes = set(), {}
     for clip in clips:
-        fields(clip, {'id', 'wav', 'expected', 'tags', 'control_phase'}, {'id', 'wav', 'expected'}, 'Clip')
+        fields(clip, {'id', 'wav', 'expected', 'tags', 'control_phase', 'speech_onset_frame'}, {'id', 'wav', 'expected'}, 'Clip')
         key = clip['id']
         if not isinstance(key, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', key):
             raise CorpusError('Clip id must contain 1..80 ASCII letters, digits, dots, _ or -.')
@@ -167,6 +167,8 @@ def load_corpus(path):
             raise CorpusError('Use separate clips for wake, intent and control grammar contexts.')
         if clip.get('control_phase', 'control') not in ('voice', 'control', 'opening'):
             raise CorpusError('control_phase must be voice, control or opening.')
+        if 'speech_onset_frame' in clip and (type(clip['speech_onset_frame']) is not int or clip['speech_onset_frame'] < 0):
+            raise CorpusError('speech_onset_frame must be a nonnegative integer annotation.')
         tags = clip.get('tags', [])
         if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
             raise CorpusError('tags must be list[str].')
@@ -192,7 +194,11 @@ def production_wake_grammar():
     if len(matches) == 1:
         call = matches[0]
         if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
-                and call.func.id == 'recognizer' and len(call.args) == 1 and not call.keywords):
+                and call.func.id == 'recognizer' and len(call.args) == 1
+                and (not call.keywords or (len(call.keywords) == 1
+                     and call.keywords[0].arg == 'fresh_on_reset'
+                     and isinstance(call.keywords[0].value, ast.Constant)
+                     and call.keywords[0].value.value is True))):
             try:
                 value = ast.literal_eval(call.args[0])
             except (ValueError, TypeError):

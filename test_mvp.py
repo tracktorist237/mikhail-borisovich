@@ -162,10 +162,11 @@ class IntentTests(unittest.TestCase):
         callbacks = []
         delivered = []
         command_texts = iter(['неизвестно', 'час'])
+        # Script describes one utterance, independently of backend recreation.
+        wake_texts = iter(['михаил'])
         class Rec:
             def __init__(self, model, rate, grammar):
                 self.wake = 'михаил' in json.loads(grammar)
-                self.wake_reported = False
             def Reset(self):
                 pass
             def AcceptWaveform(self, data):
@@ -175,8 +176,7 @@ class IntentTests(unittest.TestCase):
                 return True
             def Result(self):
                 if self.wake:
-                    text = '' if self.wake_reported else 'михаил'
-                    self.wake_reported = True
+                    text = next(wake_texts, '')
                 else:
                     text = next(command_texts, 'стоп')
                 return json.dumps({'text': text})

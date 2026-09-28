@@ -303,8 +303,8 @@ class AudioLoopIntegrationTests(unittest.TestCase):
         controls = iter(['громче', 'стоп', 'вернись', 'михаил борисович', 'вернись'])
         modes = []
         class ObservedModes(GPTModes):
-            def __init__(self, *args):
-                super().__init__(*args)
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
                 modes.append(self)
         class Rec:
             def __init__(self, model, rate, grammar):

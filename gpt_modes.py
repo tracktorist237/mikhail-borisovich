@@ -35,7 +35,9 @@ def classify_control(text, *, final, phase):
 
 
 class GPTModes:
-    def __init__(self, cfg, speech, bridge, guard, recognizer):
+    def __init__(self, cfg, speech, bridge, guard, recognizer, *, clock=None, observer=None):
+        self.clock = clock if clock is not None else lambda: time.monotonic()
+        self.observe = observer if observer is not None else lambda event, **fields: None
         self.cfg, self.speech, self.bridge, self.guard, self.rec = cfg, speech, bridge, guard, recognizer
         self.mode = LOCAL_MODE
         self.phase = 'idle'
@@ -81,7 +83,7 @@ class GPTModes:
         self.blocked_since = self.control_tick = None
         self.target_mode = mode
         self.say('Зову Ларису.' if mode == LARISA_MODE else 'Зову Антона Павловича.',
-                 'open' if mode == LARISA_MODE else 'open_anton', time.monotonic())
+                 'open' if mode == LARISA_MODE else 'open_anton', self.clock())
 
     def submit(self, action, phase=None):
         assert self.job is None
@@ -128,7 +130,9 @@ class GPTModes:
             print(f'[GPT] {result["detail"]}', flush=True)
         if action == 'close':
             self.closed_confirmed = True
+            self.observe('cleanup_confirmed')
             self.mode = LOCAL_MODE
+            self.observe('mode_entered', mode=self.mode)
             self.interrupt = False
             print(f'[{LOCAL_MODE}]', flush=True)
             self.say('Я снова слушаю.', 'idle', now)
@@ -144,6 +148,7 @@ class GPTModes:
             return
         if action in ('open', 'open_anton'):
             self.mode = self.target_mode
+            self.observe('mode_entered', mode=self.mode)
             print(f'[{self.mode}]', flush=True)
             self.rec.Reset()
             self.accept_after = now
@@ -186,18 +191,20 @@ class GPTModes:
         self.rec.Reset()
         self.preroll.clear()
         self.mic_tail = 0
+        self.observe('audio_gap', scope='gpt', reason='gap')
         if discard_through:
             self.accept_after = max(self.accept_after, now)
 
     def tick(self, now=None):
         """Service jobs and deadlines even when audio is blocked or absent."""
-        now = time.monotonic() if now is None else now
+        now = self.clock() if now is None else now
         if not self.active:
             return
         transition = (self.mode, self.phase)
         if transition != self.last_transition:
             print(f'[GPT STATE] {self.mode}/{self.phase}', flush=True)
             self.last_transition = transition
+            self.observe('mode_changed', mode=self.mode, phase=self.phase)
         # Keep servicing the guard even without admissible microphone frames.
         silent = False if self.closed_confirmed else self.guard.allows(now)
         if not self.closed_confirmed:
@@ -329,18 +336,19 @@ class GPTModes:
 
     def step(self, pcm, captured, now=None):
         live_clock = now is None
-        now = time.monotonic() if now is None else now
+        now = self.clock() if now is None else now
         if not self.active:
             return
         # Read admissible control audio before consuming a ready UI Future.
         # In particular, cancel must beat a late open or a poll that would Send.
         audio = self._control_audio(pcm, captured, now)
         if live_clock:
-            now = time.monotonic()
+            now = self.clock()
         if audio is not None and (not 0 <= now - captured <= .4 or not self.guard.allows(now)):
             self.audio_gap(now)
             audio = None
         if audio is not None and classify_control(audio[2], final=audio[1], phase=self.phase) == 'ATOMIC_RETURN':
+            self.observe('return_detected', kind='ATOMIC_RETURN')
             self.emergency = True
             self.interrupt = False
             self.chunks.clear()
@@ -354,9 +362,11 @@ class GPTModes:
         control = classify_control(text, final=final, phase=self.phase)
         if self.phase == 'control':
             if control == 'RETURN':
+                self.observe('return_detected', kind='RETURN')
                 self.submit('close', 'closing')
                 return
         elif control == 'WAKE' and self.phase not in ('closing','pausing'):
+            self.observe('return_detected', kind='WAKE')
             self.rec.Reset()
             self.resume_phase = self.phase
             self.chunks = []

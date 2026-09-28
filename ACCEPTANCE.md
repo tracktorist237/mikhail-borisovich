@@ -1,16 +1,167 @@
 # Проверки — Михаил Борисович
 
-Актуальная проверка WIP перед checkpoint — в разделе «Checkpoint 24.09.2026»
-ниже. Ранние FAIL и PASS сохранены со своими границами версии.
+Актуальный LIVE PASS 29.09.2026 — ниже; подробные выполненные AUTO проверки — в разделе
+«Expanded Loop coverage / FreshWake» в конце документа. Раздел
+«Checkpoint 24.09.2026» исторический. Ранние FAIL и PASS сохранены со своими
+границами версии.
+
+## FreshWakeRecognizer final live smoke — LIVE PASS, 29.09.2026
+
+Целевая машина: HP / Celeron N3060. Пользователь выполнил 6 циклов вместо
+требуемых 5: «Михаил» → окончание «Слушаю» → сразу «Который час».
+Версия: `feature/loop-replay`, WIP поверх
+`9b08d3269e342aee2804305844382a4753e8b8dc`, включаемый в этот checkpoint.
+Источник функциональных результатов — явное подтверждение пользователя.
+Дополнительно прочитан внешний `reports/wake-live-20260929-000023.json`:
+он подтверждает timings и SHA-256 текущего main.py, но не содержит ASR-журнал.
+Запуск: `wake_perf.py --live --report ~/mb-test-audio/reports/wake-live-…json`.
+
+**6/6 wake, 6/6 TIME, 0 unexpected duplicate wake.** Во всех показанных
+LOCAL READY: overflow=0, stale_after=0, result_stale=0, unconsumed=0.
+Intent matching пережил две неточные транскрипции — «час» и «три час»:
+
+| Цикл / generation | LOCAL final → intent | Create, мс | First Accept, мс |
+|---|---|---:|---:|
+| 1 / 2 | который час → TIME | 1,659 | 3,063 |
+| 2 / 3 | который час → TIME | 1,697 | 1,467 |
+| 3 / 4 | час → TIME | 1,648 | 1,096 |
+| 4 / 5 | который час → TIME | 2,133 | 0,839 |
+| 5 / 6 | который час → TIME | 1,765 | 1,443 |
+| 6 / 7 | три час → TIME | 1,680 | 0,837 |
+
+Рабочий observed creation range **примерно 1,65–2,13 мс**. Общий diagnostic
+max **8,05 мс** относится к initial generation 1, не к одному из шести wake.
+Generation 8 после последнего ответа: create 1,693 мс; JSON также содержит
+first_accept 0,983 мс, это не дополнительная wake-команда.
+Summary: creations=8, first_accepts=7, mean=2,540444 мс, max=8,048312 мс,
+sample_count=8, min=1,648050 мс, median=1,694869 мс, p95=8,048312 мс.
+Lifecycle samples сверх пользовательских циклов не считаются командами.
+
+Пользователь не сообщил о неприемлемой субъективной задержке или проблеме,
+блокирующей checkpoint. **Узкий LOCAL FreshWake smoke принят.** Он не доказывает
+long-duration stability, GPT/browser reliability, acoustic echo behavior или
+все аппаратные задержки. Прежние исторические FAIL/PARTIAL сохранены ниже.
+
+Перед checkpoint Python/config сверены с сохранённым baseline: изменений нет.
+Последний подтверждённый AUTO: ASR 38/38, matrix 35/35, loop 51 PASS / 0 FAIL /
+4 NOT RUN, unit 296 PASS / 0 FAIL / 8 SKIP. Четыре NOT RUN — только unverified
+exact onset timing одной записи, не functional failures; разметка не изменялась.
+38 WAV, manifest и scenarios сохранили SHA-256. Повторные unit/browser/audio
+запуски не требовались; diff и 103 локальные Markdown-ссылки проверены,
+состав checkpoint точно совпал с 28 ожидаемыми файлами.
+**BLOCKER: NO. READY FOR LOOP-REPLAY CHECKPOINT: YES.** Commit/push текущей ветки
+явно разрешены пользователем; следующий этап после checkpoint — Loop Replay Phase 2.
+
+## Историческая сводка перед live smoke — review/docs, 25.09.2026
+
+Проверены `feature/loop-replay`, HEAD
+`9b08d3269e342aee2804305844382a4753e8b8dc`, dirty WIP. В этом проходе менялись
+**только документы**. Python/config, внешний corpus и index сохранены;
+копия исходного WIP вне repo, контрольные hashes — `logs/review-docs-before.log`.
+Полный unit/replay, benchmark и физические устройства заново **не запускались**.
+Ниже результаты выполненных предыдущих прогонов, сверенные с локальными
+отчётами; source/config hashes expanded report соответствуют текущему коду.
+
+### ЖИВОЙ
+
+Сохраняется исторический full live на `4026c44`: LOCAL, два тура Антона 4/6,
+RHVoice, возврат, разговор и возврат Ларисы, Ctrl+C через обычный tee с cleanup.
+Позже, до checkpoint 9b08d32, пользователь подтвердил atomic cancel opening
+Антона/Ларисы и mic startup Ларисы; обе mic ветки — off → один click → on и
+on без click — дошли до PipeWire/LARISA_MODE, cleanup прошёл. Последние mic-runs
+не доказывают новый полноценный голосовой ответ ChatGPT.
+
+LOCAL final/intent для вызовов Антона, Ларисы и времени подтверждены пользователем;
+одна immediate попытка `михаила` → NONE принята через retry. Это не доказательство
+новой queue-регрессии. **Новый FreshWake live smoke ещё НЕ ПРОВЕРЕН**: пять
+«Михаил» → сразу после «Слушаю» «Который час», 5/5 wake и TIME, без лишнего wake,
+с приемлемой субъективной задержкой. Один такой прогон не доказывает абсолютную
+надёжность, качество звука или отсутствие любых задержек.
+
+### AUTO REAL-VOICE
+
+| Набор | PASS | FAIL | NOT RUN | Источник |
+|---|---:|---:|---:|---|
+| ASR supported | 38 | 0 | 0 | Внешний `reports/checkpoint-final.json` |
+| Expanded matrix | 35 | 0 | 0 | Внешний `reports/loop-pre-checkpoint-expanded.json` |
+| Исходные + matrix loop | 51 | 0 | 4 | Тот же expanded report; matrix входит в 51 |
+
+**38/38 уникальных supported WAV доставлены в loop**, без новых повторов
+wake/управляющих действий. Matrix использует полный input и ограниченное settle
+window, не ранний выход после успеха. Это реальная записанная речь/Vosk, но
+виртуальное время и fake устройства/Bridge; не живой ChatGPT или физический mic.
+История 10/6/4 и последующих 16/0/4 ниже сохранена.
+
+### AUTO TIMING / SYNTHETIC
+
+Последний полный unit: **296 PASS / 0 FAIL / 8 SKIP**, 304 обнаружено,
+82,719 с; лог `logs/expanded-unit-final.log`, сводка
+`logs/expanded-test-results.log`. SKIP: 7 opt-in browser и 1 Vosk-silence.
+Timing/MarkerRecognizer unit не обозначаются real-user ASR. Browser fixture
+7/7 относится к прежнему checkpoint-проходу, не запускался в Loop WIP review.
+
+FreshWake исправляет доказанный production stale partial после `Vosk.Reset()`:
+старый wake backend повторно сообщал прежнее «михаил» на новом PCM. Provenance,
+изолированное воспроизведение и regression приведены ниже. Reset теперь отпускает
+backend, следующий создаётся лениво; ни grammar, ни queue thresholds ради PASS
+не менялись. Review lifecycle/clock/observer — [CHECKPOINT.md](CHECKPOINT.md).
+
+Существующий offline measurement: 20 backend creations с одной Model, min 0,910 /
+median 0,950 / mean 0,986 / p95 1,110 / max 1,419 мс. Первый Accept на искусственной
+тишине mean 0,610 мс. Это **не LIVE responsiveness**, новый benchmark не выполнялся.
+
+### NOT RUN / подготовка onset review
+
+Четыре optional `local-speech-onset-{0,50,100,200}` остаются NOT RUN. Они используют
+**один** clip; это одна annotation для четырёх offsets, не четыре разные записи.
+Из существующего внешнего `reports/onset-suggestions.json`:
+
+| Clip | Candidate frame / время | Основание | Что подтвердить позже |
+|---|---|---|---|
+| `local-time-01` | 11840; 0,740 с, диапазон [11840,12000), 0,740–0,750 с при 16 кГц | Первые три 10-мс RMS frames выше max(200, 3×20-й percentile); threshold 291,76, noise estimate 97,25 | Является ли это началом реальной речи, не шумом; нет ли более раннего тихого начала. Подтвердить/скорректировать frame отдельно, не по успешности Vosk |
+
+Всего предложено 38 candidates, **verified 0**. Сейчас ничего не прослушивалось,
+WAV/manifest/annotations не менялись. Человек может позже проверить запись и
+дать annotation; unverified RMS никогда не становится ground truth автоматически.
+Эта работа не добавляется к единственному обязательному ближайшему live smoke.
+
+### Итог документального прохода
+
+Карта: [8 AUTO / 10 PARTIAL AUTO / 6 LIVE](COVERAGE.md). Design Phase 2,
+Agent Mode, everyday/autostart и release proposal — **не реализация** и не PASS.
+Уточнены исторические формулировки README/ROADMAP без удаления evidence.
+Проверены локальные Markdown links, `git diff --check`, состав будущего checkpoint,
+неизменность Python/config и SHA-256 38 WAV/manifest/scenarios. Py_compile не
+требовался: Python не менялся. Логи review локальные, не входят в checkpoint.
+
+**BLOCKER перед live smoke: NO. READY FOR LIVE SMOKE: YES.**
+**READY FOR CHECKPOINT: NO до 5× LOCAL smoke.** Code AUTO уже green; изменения
+настоящего звука/браузера, дополнительные функции и повторный benchmark для
+этого решения не требуются. Commit/push/merge не выполнялись.
 
 Историческая сводка 22.09.2026: полный живой regression, сообщённый
 пользователем в тот день. Артефактный лог этого прогона не предоставлен; запись
 основана на подтверждении пользователя и ограничена перечисленными шагами.
 Benchmark не запускался.
 
-## Версия и источники
+## Предыдущее AUTO: происхождение второго wake
+На том же HEAD `9b08d32`, ветка `feature/loop-replay`, сохранённый dirty WIP:
+причина установлена как недостаточный reset LOCAL wake backend в production.
+После минимального исправления неизменённые loop scenarios: **16 PASS / 0 FAIL /
+4 NOT RUN**. Четыре onset cases не размечены и не являются блокером этой диагностики.
+Полный unit: **280 PASS / 0 FAIL / 8 SKIP**. Подробное воспроизведение и границы
+приведены в конце; прежний результат не удалён.
+
+## Исходное AUTO: Loop Replay Phase 1, 24.09.2026
+Ветка `feature/loop-replay`, исходный чистый checkpoint
+`9b08d3269e342aee2804305844382a4753e8b8dc`; этот проход — незакоммиченные изменения.
+Итог: unit **271 PASS / 0 FAIL / 8 SKIP**; real-user loop **10 PASS / 6 FAIL /
+4 NOT RUN**. Это не новый LIVE PASS. Подробный разбор в конце документа.
+Старые живые результаты и checkpoint-проверки ниже относятся к прежним версиям.
+
+## Историческая версия и источники
 Фактическая ветка: `feature/chatgpt-voice`, HEAD
-`4026c44c5b11f952811925a6087bb6408b284599`, также текущий `origin/feature/chatgpt-voice`.
+`4026c44c5b11f952811925a6087bb6408b284599`, тогдашний `origin/feature/chatgpt-voice`.
 Перед этой документальной правкой рабочее дерево было чистым; проверенный live
 regression привязан к этому HEAD. Старые логи прошлых запусков относятся к своим
 датам и состояниям кода и остаются историческими свидетельствами.
@@ -910,3 +1061,413 @@ HEAD / ветка / clean или WIP (ссылка на diff либо снимо
 Хранить здесь актуальную сводку и последние результаты. Длинные логи и прошлые
 итерации оставлять по ссылке, не дублировать переписку. PASS всегда относится
 к конкретной версии и сценарию, а не ко всему проекту навсегда.
+
+
+## Loop Replay Phase 1 — доказательства 24.09.2026
+
+### AUTO: baseline и production seam
+Перед изменениями проверены `feature/loop-replay`, `9b08d32`, чистое дерево.
+Контрольные SHA-256 — `logs/loop-replay-source-before.log`.
+`logs/loop-replay-before.log`: 105 обнаружено, **104 PASS / 0 FAIL / 1 SKIP**,
+4,680 с (LOCAL readiness, atomic return, resilience, ASR replay).
+
+`listen(..., runtime=None)` использует обычные зависимости. Injected runtime
+заменяет только clock/input/Speech/Bridge/guard/system executor/observer;
+callback, FreshAudioQueue(12), CommandSession, грамматики и GPTModes настоящие.
+В GPTModes единый injected monotonic; наблюдение `mode_entered` отмечает сам
+переход, `mode_changed` — фазовый опрос. Observer по умолчанию no-op.
+Production Speech, CapturedPCM, очередь, matcher, системные команды, battery,
+весь browser lifecycle/Voice startup и config сверены с HEAD: без изменения
+AST/байтов соответствующих частей. Freshness 400 мс/cooldown/budgets не менялись.
+
+В scheduler эпоха input clock = monotonic + 10000; capture start/end, доставка
+callback и обслуживание main-loop независимы. PCM идёт 1600-frame блоками через
+production callback без resample/trim/normalize. События имеют стабильный порядок,
+ограничены временем/числом; реальных sleep для виртуальных секунд нет.
+Fake wake/control cue = 6 с, обычный ответ = 0,3 с после synthesis 0,1 с.
+Это параметры среды для полных WAV с хвостовой тишиной, не измерения RHVoice.
+
+### AUTO SYNTHETIC TIMING
+`test_replay_support` + `test_loop_replay`: **31 PASS / 0 FAIL / 0 SKIP**,
+1,551 с в точечном прогоне (`logs/loop-targeted.log`). Unit-WAV искусственные,
+ASR в них явно scripted test double; это НЕ доказательство качества Vosk.
+Исполняются настоящий listen, CommandSession, GPTModes и настоящая очередь.
+
+Проверены stable ordering, max-time/events, разные clock epochs, поздняя доставка
+без сдвига capture timestamps; main stall с продолжающимся capture и overflow;
+gap/reset, отбрасывание старого PCM и следующая свежая команда; late TTS и
+проверка capture_start каждого command-блока относительно boundary; сдвиги
+0/50/100/200 мс и callback 0/100/250/400/2000 мс; retry/cooldown и два wake-цикла.
+GPT: normal open, pending-open atomic, подтверждение cleanup перед LOCAL,
+реальный поздно завершившийся fake Future, two-step и negative/silence,
+запрет control-аудио при active/unavailable guard при продолжающемся tick.
+Unknown Bridge/system action вызывает FAIL. PCM/секретные поля отвергаются sink.
+
+Во время разработки тестами закрыты два дефекта harness: короткая transition
+задержка больше не сокращает другой main stall; вход в режим наблюдается в
+момент присвоения mode, а не после следующего tick/poll. Production поведение
+для этого не изменено — добавлены события. Начальные неудачные прогоны сохранены
+в `logs/loop-unit.log`, `logs/loop-real-voice.log`, новые — отдельно.
+
+### AUTO REAL-VOICE REPLAY
+Использованы 7 неизменённых пользовательских WAV cases: `wake-mikhail-01`,
+`local-time-01`, `anton-open-01`, `larisa-open-01`, `atomic-return-planned-01`,
+`return-wake-01`, `return-command-01`. Название atomic case историческое:
+его manifest уже ожидает поддерживаемый ATOMIC_RETURN. Ни expected, ни WAV
+не подгонялись. Все 38 WAV + manifest (39 файлов) сверены SHA-256 до/после.
+Создан отдельный внешний `~/mb-test-audio/loop-scenarios.json`.
+
+Настоящие Vosk Model/KaldiRecognizer, одна Model на прогон, новые recognizers
+на сценарий. Нет FinalResult для искусственного EOF PASS. Отчёт:
+`~/mb-test-audio/reports/loop-phase1-final.json`; stdout:
+`logs/loop-real-final.log`. Exit 1: обязательные проверки не все прошли.
+
+| Сценарий | Результат | Virtual time, с |
+|---|---|---:|
+| local-clip-start-0 | FAIL | 22.000 |
+| local-clip-start-50 | FAIL | 22.000 |
+| local-clip-start-100 | FAIL | 22.000 |
+| local-clip-start-200 | FAIL | 22.000 |
+| local-callback-100 | PASS | 22.000 |
+| local-callback-250 | FAIL | 22.050 |
+| local-callback-400 | PASS | 22.000 |
+| local-callback-2000 | PASS | 22.000 |
+| local-speech-onset-0 | NOT RUN | 0.000 |
+| local-speech-onset-50 | NOT RUN | 0.000 |
+| local-speech-onset-100 | NOT RUN | 0.000 |
+| local-speech-onset-200 | NOT RUN | 0.000 |
+| anton-open | PASS | 13.000 |
+| anton-atomic-pending | PASS | 42.000 |
+| larisa-open | PASS | 11.200 |
+| larisa-atomic-pending | PASS | 42.000 |
+| larisa-two-step | PASS | 42.000 |
+| negative-wake-mikhail-01 | PASS | 28.000 |
+| negative-return-command-01 | PASS | 28.000 |
+| local-overflow-then-fresh | FAIL | 25.000 |
+
+**10 PASS / 6 FAIL / 4 NOT RUN.** В четырёх clip-start случаях, callback-250
+и overflow-then-fresh TIME выполнен ровно один раз; FAIL — дополнительный wake
+«михаил» позже в исходном WAV/его хвосте (wake_count=2 вместо 1). Например,
+local-clip-start-0: wake 1,3 с → TIME 9,8 с → ещё wake 11,1 с.
+Это воспроизводимый результат именно данной виртуальной среды с коротким
+fake-ответом, не доказанная причина прежнего живого «Не понял» и не доказательство
+реального акустического эха. Не изменяли grammar, aliases, thresholds или
+производственную очередь ради PASS. Нужен отдельный разбор дополнительного wake.
+
+Callback-400/2000 PASS означает запрет устаревшей команды, а НЕ её успешное
+распознавание. Overflow case действительно вытесняет старые блоки/сбрасывает
+контекст; следующая команда TIME проходит, но строгий wake_count остаётся FAIL.
+Atomic pending open и late results, оба normal open, two-step и negative control
+прошли с реальным Vosk. Закрытие здесь fake-confirmed: это не новое доказательство
+reaping настоящего Firefox. В two-step после возврата также виден ещё один wake;
+этот сценарий проверяет возврат/cleanup, а не число wake во всём хвосте.
+
+Все 4 speech-onset сценария **NOT RUN**: нет проверенной onset annotation.
+Смещения clip-start не заменяют смещения начала речи. Нельзя объявлять immediate
+readiness 0 мс на пользовательском голосе принятой только по этим прогонам.
+Поддержан необязательный `speech_onset_frame` manifest v1 или отдельные verified
+annotations; автоматические RMS-кандидаты за ground truth не выдавались.
+
+### Проверки и безопасность
+| Набор | PASS | FAIL | SKIP | Длительность |
+|---|---:|---:|---:|---:|
+| Baseline до изменений | 104 | 0 | 1 | 4,680 с |
+| Новые scheduler/runtime/loop | 31 | 0 | 0 | 1,551 с |
+| Новые + ASR/LOCAL/atomic/resilience | 135 | 0 | 1 | 6,118 с |
+| Полный unit, один запуск | 271 | 0 | 8 | 79,204 с |
+
+Наборы пересекаются, количества не складываются. Полный набор — 279 обнаружено;
+пропущены 7 opt-in browser и 1 opt-in Vosk-silence. Browser fixtures не запускались,
+поскольку browser production-код не менялся. Полный unit содержит прежние tests
+управляемых worker/subprocess с FakeUI: они запускались, Firefox не запускался.
+После завершения browser_worker/geckodriver/Firefox отсутствуют; пользовательский
+Firefox не закрывался. Внешние timeout: baseline 120 с, targeted 90 с, полный 240 с,
+real replay 600 с. Логи `logs/loop-*.log`, проверка процессов/источников:
+`logs/loop-safety-final.log`.
+
+`git diff --check` и py_compile 8 новых/изменённых Python прошли.
+Нет WAV/logs/profile/model/.venv в git index. В corpus добавлены только отдельные
+scenario/report файлы; записи и ASR manifest неизменны. Report содержит hashes,
+относительные WAV имена и скалярные события, без PCM/абсолютных home paths.
+Replay блокирует запуск внешних процессов, сетевые соединения и реальные system
+adapters. Model читается по существующему локальному пути, без загрузок из сети.
+
+### LIVE и границы готовности
+Живой микрофон, RHVoice, ChatGPT/Voice и permissions в этом проходе **НЕ ПРОВЕРЯЛИСЬ**.
+Исторические LIVE PASS выше сохранены, но не перенесены на новый runtime seam.
+Loop не доказывает реальное эхо, scheduler/PortAudio/PipeWire races, фактическую
+latency Celeron, сеть, слышимый ответ ChatGPT или аппаратную готовность.
+
+Review: код harness позволяет автономно воспроизводить сценарии; production
+пороги/политики сохранены. **READY FOR LOOP-REPLAY CHECKPOINT: NO** как для полного
+приёмочного baseline: шесть обязательных scenario assertions красные, точный
+real onset не размечен. Следующий шаг — автономно разобрать дополнительный wake
+и подготовить проверенную onset-разметку; не просить повторять длинный live-run
+и не подгонять ожидания ради зелёного результата.
+
+
+## Второй LOCAL wake — диагностика и исправление, 24.09.2026
+
+### Установленная причина: PRODUCTION reset lifecycle
+Повторён простейший `local-clip-start-0` с `--debug-trace`, затем все шесть FAIL.
+В исходной версии обёртка вызывала Vosk `Reset()`, но тот же wake backend
+сохранял состояние, достаточное для повторного partial «михаил» после паузы.
+Это ошибка достаточности reset в production использовании; не повтор WAV,
+не FakeSpeech PCM и не доказанное слово «михаил» внутри записи времени.
+Конкретная внутренняя структура Vosk, удерживающая состояние, не установлена.
+
+Доказательство вне loop harness, на настоящем Vosk и той же grammar/model:
+- свежий recognizer, исходные frames 54400..59199 из `local-time-01`: partial пустой;
+- свежий recognizer на всём хвосте с frame 54400: «михаил» не возникает;
+- прежние wake-входы + те же Reset + хвост: partial «михаил» появляется снова;
+- тот же прежний recognizer, но вместо хвоста поданы нули: «михаил» снова появляется;
+- замена экземпляра на reset устраняет повтор; полный command WAV с LOCAL grammar
+  по-прежнему даёт «который час».
+Логи: `logs/second-wake-isolated.log`, `logs/second-wake-context.log`.
+В изоляции EOF FinalResult — только диагностика, не основание PASS.
+
+`test_wake_reset_cannot_reuse_backend_feature_context_after_time` сначала
+воспроизвёл FAIL `wake_count` при правильно выполненном TIME, затем прошёл.
+В обычном unit это явная модель обнаруженного backend-поведения, не настоящий
+пользовательский Vosk; настоящее воспроизведение — отдельные логи/отчёты выше.
+Это применимо к continuous microphone: после ответа цикл снова WAITING, шумовой
+блок допускает wake backend, а прежнее состояние может дать старый partial.
+Для этого не требуется реальный echo или повторное проигрывание записи.
+
+### Provenance первого FAIL
+Wake 1,3 с → TIME 9,8 с → окончание fake-ответа 10,2 с → cooldown → WAITING
+10,81 с. В 10,81 и 10,9 с wake `recognizer=0` получил Reset (generation 5, затем 6).
+Следующие capture/callback/queue/ASR события:
+
+| WAV block index (от 0) | Source frames [start,end) | Capture clock | Delivery / ASR |
+|---|---|---|---|
+| 34 | 54400..56000 | 10010,8..10010,9 | 10,9 с, partial пустой |
+| 35 | 56000..57600 | 10010,9..10011,0 | 11,0 с, partial пустой |
+| 36 | 57600..59200 | 10011,0..10011,1 | 11,1 с, partial «михаил» |
+
+Все три — `local-time-01`, step 1, world blocks 108..110, состояние WAITING,
+тот же recognizer 0 / reset generation 6. Epoch audio clock = monotonic + 10000.
+После исправления те же блоки поступили новому `recognizer=4 / generation=0`:
+partial пустой. Их источник, время доставки и полный WAV не изменились.
+
+### Сопоставление шести FAIL до исправления
+| Scenario | Второй wake, с | WAV blocks | Capture clock | Backend/reset generation |
+|---|---:|---|---|---|
+| local-clip-start-0 | 11.1 | 34,35,36 | 10010.8..10011.1 | 0/6 |
+| local-clip-start-50 | 11.1 | 33,34,35,36 | 10010.8..10011.1 | 0/6 |
+| local-clip-start-100 | 11.1 | 33,34,35 | 10010.8..10011.1 | 0/6 |
+| local-clip-start-200 | 11.2 | 33,34,35 | 10010.9..10011.2 | 0/6 |
+| local-callback-250 | 11.75 | 34,35,36 | 10011.3..10011.5 | 0/6 |
+| local-overflow-then-fresh | 17.6 | 34,35,36 | 10017.3..10017.6 | 0/6 |
+
+Везде источник `local-time-01`, состояние WAITING. При offset 50/250 мс WAV-блок
+разделяется между соседними capture-блоками: непересекающиеся фрагменты не являются
+повторной доставкой. В overflow case это второй, явно объявленный step записи TIME.
+Источник один по типу, причина одна; полные таблицы — `logs/second-wake-sources.log`.
+
+### Исправление и invariant
+Только LOCAL wake использует `FreshWakeRecognizer`: Reset отпускает прежний backend,
+следующий допущенный PCM лениво создаёт новый с прежней Model и grammar. Model
+не перезагружается. Command/control recognizers, `gpt_modes.py`, queue capacity,
+stale/playback/cooldown, thresholds и browser-код в этом проходе не менялись.
+В `audio_replay.py` узко адаптировано чтение прежней wake grammar из AST к явному
+`fresh_on_reset=True`, без копии grammar или изменения эталонов.
+
+Добавлен replay-only `--debug-trace`: clip/step, блоки, исходные frame ranges,
+capture/delivery/queue, instance/reset IDs, partial/final, state transitions и
+окончание сценария. В trace нет PCM/локальных переменных/переписки GPT.
+`replay_trace.py` наблюдает тот же экземпляр очереди и проверяет соответствие
+пакета recognizer последним реальным dequeued блокам, включая preroll.
+Обычный production logging не расширен; trace не включается без флага.
+
+Постоянные invariants запрещают duplicate capture delivery и пересечение уже
+доставленных source ranges внутри одного объявленного step/clip/block.
+Повтор того же clip возможен только отдельным явно объявленным step.
+Тесты проверяют unaligned fragments, duplicate отказ, отсутствие callback после
+закрытия stream, отсутствие генерируемого FakeSpeech PCM, provenance endpoint
+TIME (не routed в wake повторно) и ленивое создание нового backend.
+
+### Завершение сценариев — без маскировки late wake
+Изменять scenario semantics не потребовалось. WAV — непрерывная microphone timeline:
+после endpoint оставшийся хвост продолжает поступать. В реальном микрофоне его
+аналог — новые последующие capture-блоки; endpoint не отменяет физический timeline.
+Вырезание хвоста при TIME скрыло бы найденную ошибку. FakeSpeech меняет только
+lifecycle, не синтезирует свой текст в PCM.
+
+Success определяется неизменённым `expected` на полном интервале `duration`.
+LOCAL duration 22 с (overflow 25 с) оставлен: проверяются TIME ровно один раз
+и wake_count=1, включая послеответное окно. Для базового случая последний WAV
+заканчивается в 12,4 с; затем до 22 с идёт искусственная тишина без новых steps.
+Это явное bounded окно наблюдения; его не сократили до успеха TIME.
+Atomic/two-step — 42 с, negative control — 28 с: поздние Future/действия остаются
+видны. Normal open использует объявленный stop_at mode как ограниченную проверку
+входа, а не обещание quiescence/cleanup полноценного разговора.
+Дополнительный settle cutoff не понадобился; неожиданный wake случался до EOF,
+а не из-за беспричинного продолжения за последним WAV.
+`loop-scenarios.json` и его expectations побайтово сохранены.
+
+### Результаты после исправления
+- Exact scenario: **1 PASS / 0 FAIL**, duration 22 с.
+- Все шесть прежних FAIL: **6 PASS / 0 FAIL**, прежние duration и wake_count.
+- Полный real-user loop: **16 PASS / 0 FAIL / 4 NOT RUN**, CLI exit 0.
+  Onset NOT RUN — необязательные cases без verified annotation; они не стали PASS.
+Отчёты вне Git: `reports/second-wake-{exact,six-before,exact-after,six-after,final}.json`.
+Логи в `logs/second-wake-*.log`. Ни личные WAV, ни исходный ASR manifest не изменены.
+
+### Итоговые проверки и границы
+| Проверка | PASS | FAIL | SKIP / NOT RUN | Время |
+|---|---:|---:|---:|---:|
+| Новые/существующие targeted, включая retry | 159 | 0 | 1 SKIP | 8,626 с |
+| Финальный полный unit | 280 | 0 | 8 SKIP | 81,312 с |
+| Прежние шесть real FAIL после исправления | 6 | 0 | 0 | прежние virtual duration |
+| Полный real-user loop | 16 | 0 | 4 NOT RUN | прежние virtual duration |
+
+Полный набор обнаружил 288 тестов. Для прозрачности: первый полный запуск этого
+прохода был **278 PASS / 2 FAIL / 8 SKIP**, 81,715 с; он не скрыт
+(`logs/second-wake-unit-final.log`). После него понадобился повтор выше
+(`logs/second-wake-unit-verified.log`). Причины двух FAIL — fixtures:
+`test_audio_feedback_and_retry` генерировал «михаил» заново на каждом созданном
+fake backend; теперь один scripted utterance общ для экземпляров, как уже было
+для command_texts. Проверки единственного TIME/retry/отбрасывания echo сохранены.
+Новый trace-тест ожидал третьего ленивого backend при отсутствии допущенного
+звука после ответа; добавлен явный не-wake PCM после TIME, чтобы проверить именно
+новый instance и отсутствие повторной маршрутизации endpoint. Assertion не снят.
+Предыдущий targeted также показал эту ошибку trace-fixture; окончательный targeted
+и полный набор прошли. Тесты пересекаются, числа не складываются.
+
+`git diff --check` и py_compile всех 11 изменённых/новых Python-файлов WIP прошли.
+Все 38 WAV + ASR manifest сохранили SHA-256, файл scenarios и expected побайтово
+сохранены; before-copy вне repo, hash/copy-location в `logs/second-wake-*.log`.
+В report нет PCM/абсолютных home paths; новые diagnostic artifacts локальны.
+Никакого Firefox/ChatGPT/микрофона/RHVoice не запускалось. Полный unit запускал
+прежние управляемые process fixtures с FakeUI; после них нет browser_worker,
+geckodriver или Firefox. Посторонние процессы не завершались. Browser fixtures
+не запускались: browser production-код не изменён. Пропуски unit — прежние семь
+opt-in browser и один opt-in Vosk-silence, не новые скрытые регрессии.
+
+**BLOCKER second-wake: NO. READY FOR LOOP-REPLAY CHECKPOINT: YES** в рамках
+16 обязательных сценариев. Четыре onset cases остаются NOT RUN, не live PASS и
+не blocker именно этой диагностики. Производительность создания нового маленького
+wake backend на Celeron и новый живой regression не измерялись; Model общая,
+ленивая конструкция не добавлена в audio callback. Очередь/пороги/grammar не
+менялись, но стоимость смены backend надо учитывать при следующем live-тесте.
+Новый ручной прогон в этом проходе не выполнялся. Commit/push не делались.
+
+
+## Expanded Loop coverage / FreshWake — АВТО, 24.09.2026
+`feature/loop-replay`, HEAD `9b08d3269e342aee2804305844382a4753e8b8dc`, dirty WIP.
+Предыдущие исходники сохранены вне repo; путь/hash snapshot —
+`logs/expanded-before.log`. **Production-файлы в этом проходе не менялись**:
+main/GPTModes/browser/monitor/config и прежние queue/playback/battery исправления
+сохранены. Новые helper/launcher не импортируются обычным production entrypoint.
+
+### FreshWake: read-only review и инструментация
+Первый backend создаётся при инициализации listen до запуска stream/приветствия;
+он отпускается первым Reset. Далее Reset делает `rec=None` и отпускает старый
+backend. Новый появляется лениво на первом допущенном PCM; повторные Reset без
+PCM ничего не создают. Обычно один backend на допущенный wake-отрезок, плюс
+первоначальный экземпляр за запуск; строгого числа «на цикл» нет: gap/stale и
+новый RMS-отрезок после истечения tail также сбрасывают wake. В детерминированном
+одном цикле без нового шума — два создания вместе с первоначальным.
+
+Factory держит одну общую Model/grammar, а не прежний backend. Локальная `rec`
+в listen ссылается на wrapper, не на освобождённый backend. В установленном Vosk
+`KaldiRecognizer.__del__` вызывает `vosk_recognizer_free`. Weakref-тест подтвердил
+освобождение backend/model refs и отсутствие удержания instrumentation; это
+проверка Python lifetime, не длительный native-memory soak. Утечка не доказана.
+Конструктор/Accept идут в main thread, не в callback. Во время playback/cooldown
+recognition path не допускается; callback только кладёт PCM. Создание способно
+задержать main loop и конкурировать за CPU — фактическая live стоимость ещё
+не принята. Начальное лишнее создание оставлено, speculative optimization нет.
+
+`wake_perf.py` — отдельный opt-in инструмент. Без `--live` только offline Vosk;
+с `--live` временно оборачивает FreshWake factory и вызывает обычный `main.main()`
+с прежними cleanup/SIGINT semantics. По умолчанию приложение его не использует.
+Измеряются create/первый Accept/generation, mean/max/count; нет PCM/речи в метриках.
+Хранятся максимум 1000 числовых записей, mean/max/count за весь запуск. Модель
+не перезагружается, backend refs статистика не удерживает. Обычные LOCAL ASR logs
+приложения при live-launcher сохраняются отдельно от этих метрик.
+
+### AUTO REAL-VOICE REPLAY: coverage matrix
+Матрица генерируется из manifest expected, без вызова matcher для эталона:
+8 wake variants, 15 LOCAL intents, 6 GPT opens, 3 пары two-step с покрытием всех
+6 control WAV, 3 atomic cancel pending open. **35 PASS / 0 FAIL / 0 NOT RUN**.
+Каждая из **38 supported WAV реально доставлена в callback**, coverage **100%**.
+С исходными scenarios: **51 PASS / 0 FAIL / 4 NOT RUN**. Первый expanded запуск
+дал те же числа; итоговый повтор уточнил только метаданные фактической доставки.
+`reports/loop-pre-checkpoint-expanded.json` находится во внешнем corpus и содержит
+HEAD, source/dirty fingerprint, manifest/scenario/WAV hashes, coverage и matrix
+results. Источник scenarios/expected/WAV не изменён; templates добавляются в памяти.
+
+У каждой новой matrix есть wake_count=1, точные количества LOCAL/управляющих
+Bridge-действий и проверка окна минимум 2 с после последнего полного WAV/значимого
+результата. Наблюдение идёт всю duration: 25 с для LOCAL/wake, 45 с для GPT;
+нет раннего выхода по успеху. Обычные open дополнительно отменяются atomic после
+входа в режим и подтверждают fake cleanup. У Антона до этого допускается один
+pending dictate, но Send запрещён. Periodic poll не является duplicate действием.
+**Неожиданных повторов wake/intent/управляющих действий не найдено.**
+Отдельный regression вводит поздний повтор и получает FAIL; короткое окно
+settle также даёт FAIL даже при успешно выполненном TIME.
+
+### Onset и предел доказательства
+`reports/onset-suggestions.json`: предложено **38 кандидатов, verified 0**.
+Критерий — первые три 10-мс RMS frames выше max(200, 3×20-й percentile RMS);
+шум тоже может удовлетворять критерию. Это НЕ production threshold/разметка речи.
+Четыре прежних NOT RUN используют одну запись `local-time-01` и offsets
+0/50/100/200 мс: candidate_start_frame=11840, диапазон [11840,12000), около 0,74 с.
+Нужна одна проверенная annotation для этой записи, а не четыре разных WAV.
+Ничего автоматически не повышено до PASS; clip-start replay не доказывает
+нулевое смещение реального speech onset.
+
+### Offline стоимость wake backend, не LIVE latency
+На этой машине `/proc/cpuinfo`: Intel Celeron N3060. Model загружена один раз;
+20 последовательных recognizers, без пользовательского WAV, первый Accept —
+100 мс искусственной тишины. Настройки CPU/системы не менялись.
+Создание, мс: **min 0.910 / median 0.950 /
+mean 0.986 / p95 1.110 / max 1.419**.
+Первый Accept: mean 0,610 мс, max 0,714 мс. p95 — nearest rank по всем 20 samples.
+Report `reports/wake-creation-offline.json`, лог `logs/expanded-wake-offline.log`.
+Это оценка отдельной операции после загрузки модели, **не доказательство**
+отсутствия слышимой задержки/CPU starvation/акустического эха при live нагрузке.
+
+### Unit и аудит
+| Набор | PASS | FAIL | SKIP | Время, с |
+|---|---:|---:|---:|---:|
+| freshwake | 3 | 0 | 0 | 0.125 |
+| perf | 5 | 0 | 0 | 0.092 |
+| scheduler-runtime | 13 | 0 | 0 | 0.015 |
+| loop | 35 | 0 | 0 | 3.044 |
+| asr | 35 | 0 | 1 | 1.673 |
+| local | 31 | 0 | 0 | 1.596 |
+| atomic | 10 | 0 | 0 | 0.155 |
+| resilience | 28 | 0 | 0 | 1.340 |
+| recorder | 34 | 0 | 0 | 3.084 |
+| unit | 296 | 0 | 8 | 82.719 |
+
+Полный unit **один раз**, обнаружено 304, выполнено 296, успешно все;
+8 opt-in SKIP = прежние 7 browser + 1 Vosk-silence. Настоящий пользовательский
+Vosk отдельно выполнен в matrix, не подменён mock. Synthetic timing и helper
+unit не являются real-voice evidence. Наборы пересекаются, числа не складываются.
+Логи `logs/expanded-*-final.log`, числа `logs/expanded-test-results.log`.
+Везде внешние timeout; физических audio/browser fixtures не запускали.
+
+`git diff --check`, py_compile всех 16 изменённых/новых Python WIP пройдены.
+Все 38 WAV, ASR manifest и loop-scenarios.json сохранили исходные SHA-256.
+Отчёты вне Git, в них нет PCM или абсолютных home paths. В index/status нет
+WAV, внешнего corpus/manifest, logs, .venv, моделей или профиля. Imports проверены;
+все нужные untracked harness/tests перечислены для будущего checkpoint.
+Прежний персональный абсолютный cd в README заменён на `~/mikhail-borisovich`.
+Browser production не менялся, fixtures не запускались. Unit запускал только
+прежние управляемые process doubles; итоговая проверка — `logs/expanded-safety.log`.
+
+### LIVE / готовность на дату expanded AUTO (до smoke 29.09)
+Новый live smoke **НЕ ПРОВЕРЕН**. Исторические LIVE результаты сохранены;
+новый AUTO не доказывает фактический Echo/PortAudio/PipeWire race, permissions,
+ChatGPT Voice, сетевой ответ или UX задержку на ноутбуке.
+**BLOCKER к короткому live smoke: NO. READY FOR FINAL LIVE SMOKE: YES.**
+**READY FOR LOOP-REPLAY CHECKPOINT: NO до запрошенного 5× LOCAL smoke**;
+кодовые AUTO-проверки пройдены. Требуется только пять «Михаил» → сразу после
+«Слушаю» «Который час»: 5 wake/5 TIME, без второго wake, субъективная задержка
+приемлема; инструмент даст create/first_accept числа. Onset-разметка остаётся
+отдельным ограничением optional timing cases и не требует длинного live regression.
+Commit/push/merge не выполнялись.

@@ -6,18 +6,54 @@
 выполнение многошаговых просьб с помощью GPT, не запуск произвольного shell-кода.
 
 ## Снимок состояния
-Сверен 24.09.2026: ветка `feature/chatgpt-voice`, HEAD
-`4026c44c5b11f952811925a6087bb6408b284599` (`origin/feature/chatgpt-voice`).
-Поверх checkpoint находятся незакоммиченные UX-правки LOCAL_MODE, склонения
-времени, готовности/бюджета запуска Ларисы, ASR replay и atomic return. Существовавшие изменения документов сохранены. Основания и ограничения —
-в [ACCEPTANCE.md](ACCEPTANCE.md).
+29.09.2026: `feature/loop-replay`, база `9b08d3269e342aee2804305844382a4753e8b8dc`.
+Перед Loop Replay дерево было чистым. Предыдущий WIP уже сохранён в checkpoint;
+описанные ниже старые результаты относятся к своим версиям.
 
-## Сейчас: накопленный WIP готов к одному checkpoint
+## Сейчас: Loop Replay Phase 1 — AUTO и финальный LOCAL live smoke PASS
+На сохранённом WIP поверх `9b08d32`: исходные scenarios **16 PASS / 0 FAIL /
+4 NOT RUN**, новая matrix **35 PASS / 0 FAIL**, вместе **51 PASS / 0 FAIL /
+4 NOT RUN**. Все 38 supported WAV участвуют в настоящем listen/Vosk loop;
+повторных wake/действий нет. Полный unit **296 PASS / 0 FAIL / 8 SKIP**.
+Production-код в проходе расширения coverage не менялся. Исправление FreshWake
+из предыдущего прохода сохранено; второй wake после Vosk Reset больше не
+воспроизводится. Очередь/stale/playback/grammar не подгонялись.
+
+**29.09 пользователь выполнил 6× «Михаил» → сразу после «Слушаю» «Который час»:
+6/6 wake, 6/6 TIME, без duplicate wake.** Неприемлемая субъективная задержка не
+сообщена; рабочий create ≈1,65–2,13 мс, общий diagnostic max 8,05 мс.
+Узкий LOCAL gate пройден, checkpoint commit/push разрешён пользователем.
+**Следующий этап после checkpoint — Loop Replay Phase 2**, без реализации в
+документальном проходе; [design](LOOP-REPLAY-PHASE2.md).
+
+Текущий проход — docs и разрешённый checkpoint; Python и runtime behavior не изменены,
+старый AUTO не обозначается новым запуском. [Карта покрытия](COVERAGE.md) отделяет
+заменённые ручные проверки от hardware/UI. [Состав checkpoint и review](CHECKPOINT.md)
+готовы; merge/tag не выполняются. Разметка onset не блокирует checkpoint.
+
+Offline 20 созданий backend на Celeron: mean ≈0,99 мс, max ≈1,42 мс,
+одна общая Model, первый Accept — искусственная тишина. Это не оценка live
+responsiveness под нагрузкой; подробные числа и проверки — в ACCEPTANCE.
+
+Четыре onset cases остаются NOT RUN: одна запись `local-time-01` с четырьмя
+смещениями. RMS candidate frame 11840 предложен, но НЕ verified. Это отдельное
+ограничение точных onset assertions, не blocker checkpoint. `suggest_onsets.py`
+не меняет WAV/manifest и не выдаёт кандидаты за ground truth.
+
+Автоматика покрывает supported voice routing, pending-open atomic cancel,
+late results, двухшаговый возврат, отрицательные control-фразы и synthetic timing.
+Живыми остаются акустическое эхо, реальные playback/driver задержки, permissions,
+ChatGPT Voice/сеть/ответ и удобство immediate LOCAL. Исторические live PASS не
+переносятся на новый WIP; новый LOCAL smoke имеет свои узкие границы. После checkpoint — дальнейшие onset/loop scenarios,
+короткий повторяемый live regression при соответствующих изменениях, затем
+повседневный запуск/autostart и v0.3. Bridge/SIGINT не возвращаются в активные.
+
+## Исторический проход перед checkpoint 9b08d32
 Функции в checkpoint-проходе не добавлялись. Финальный unit: 240 PASS / 0 FAIL /
 8 opt-in SKIP; локальный browser fixture: 7 PASS / 0 FAIL / 0 SKIP; реальный corpus:
 38 supported PASS / 0 FAIL. Пять повторов process-теста прошли; тестовых остатков нет.
-Ограничения и разбор короткого test budget — в ACCEPTANCE. Commit выполняет
-пользователь отдельным решением; следующий этап после него — короткий live regression.
+Ограничения и разбор короткого test budget — в ACCEPTANCE. Это история подготовки
+уже сохранённого `9b08d32`; актуальное состояние — в начале документа.
 
 24.09 пользователь подтвердил atomic cancel во время opening Антона и Ларисы,
 а также глубокого mic startup Ларисы; очистка и LOCAL_MODE восстановлены.
@@ -83,16 +119,21 @@ stale policy и playback boundary снова не менялись. Добавл
 ждёт подтверждённого mic_on. Неоднозначность и неподтверждённое включение дают
 понятный отказ/cleanup. Общие budgets и PipeWire logic сохранены.
 
-Ближайшая задача после автоматических проверок — короткий живой regression ниже.
+Историческая очередь до последующих live подтверждений — regression ниже.
 LOCAL проверяется с final/intent diagnostic, Лариса — по структурным mic-стадиям
 и подтверждённой очистке. Новая переделка LOCAL архитектуры
 без воспроизводимого дефекта не планируется.
 Автоисправление не означает новый live PASS.
-LOCAL «Слушаю» fix сохранён и всё ещё ожидает окончательного живого acceptance:
+На тот момент LOCAL «Слушаю» fix ожидал живого acceptance:
 команда сразу после последнего слога, без намеренной паузы, первое слово не теряется,
 самопрослушивания и ложных команд нет.
 
-## После checkpoint: короткий повторяемый live regression
+## Архив плана regression перед новым Loop Replay WIP
+
+Это прежний план, частично выполненный 24.09. Он не добавляет ещё один обязательный
+live-набор к уже принятому LOCAL smoke. При следующем release выбирать относящиеся к
+изменениям проверки по [COVERAGE.md](COVERAGE.md).
+
 Control replay использует production-классификацию. На внешнем corpus сначала
 получено 35 supported PASS / 0 FAIL и 3 planned; после реализации atomic return
 и явного обновления ожиданий трёх cases — 38 supported PASS / 0 FAIL.
@@ -105,7 +146,8 @@ control wake теперь ждёт final Vosk, чтобы partial-префикс
 фразу. Во время TTS/активного выхода/недостоверного monitor распознавание запрещено.
 АВТО не подтверждает удобство endpoint-задержки на реальной машине.
 
-Провести короткую серию, не benchmark:
+Прежний план короткой серии (не текущее поручение пользователю):
+
 1. LOCAL: три команды сразу после «Слушаю», без намеренной паузы; сохранить final/intent.
 2. Atomic cancel: отдельно «Позови Антона Павловича» и «Позови Ларису»;
    во время opening сказать «Михаил вернись». Дождаться owned descendants reaped
@@ -126,14 +168,19 @@ budget 3 с. Подробный разбор этапа supervisor exit, изм�
 Production budgets и архитектура Bridge/SIGINT не меняются.
 
 ## Очередь этапов
+
 | Этап | Результат / условие перехода |
 |---|---|
-| 1. Устойчивость ядра | Закрыт для дальнейшей разработки по текущим проверкам. Очередь, tick/monitor, Bridge и SIGINT/pipeline прошли автоматические проверки; полный живой regression на HEAD подтвердил возвраты и очистку. Один прогон не доказывает абсолютную надёжность. |
-| 2. Проверенная v0.2.1 | После живой проверки старта Ларисы и LOCAL UX повторить полный живой regression; затем несколько повторов, прогон 30–60 минут, проверка ошибок и CPU/RAM/zram. Не переносить текущий одиночный PASS на длительную работу. |
-| 3. Loop Replay Harness | Детерминированно подавать внешний PCM corpus в настоящий listen loop; timestamps, playback boundary, queue pressure и gap. ASR replay уже есть; runtime injection — отдельная следующая задача. |
-| 4. Повседневный запуск | Звуковая готовность, понятные ошибки, один экземпляр, пользовательский автозапуск и восстановление; отдельная задача после regression и замеров. |
-| 5. v0.3 — Agent Mode | Сначала GPT предлагает план без исполнения; затем 3–5 полезных сценариев из ограниченного набора инструментов. Валидация параметров, подтверждение чувствительных действий, проверка результата. |
-| 6. Расширение | Заметки, документы, напоминания и другие функции по реальному использованию; отдельный инструмент и тесты для каждой. |
+| 1. v0.2.1 / устойчивость | Checkpoint 9b08d32 сохранён. Bridge/SIGINT закрыты по относящимся к ним проверкам; исторический полный live — на своей версии, не текущем HEAD/WIP. |
+| 2. Loop Replay Phase 1 | Реализован, AUTO green; 29.09 финальный LOCAL smoke 6/6 PASS. Checkpoint commit/push разрешён; подробности в ACCEPTANCE. |
+| 3. Loop Replay Phase 2 | [Проект](LOOP-REPLAY-PHASE2.md): multi-turn GPT, failure injection, real control matrix; пока без реализации. |
+| 4. v0.2.x / повседневный запуск | Относящийся к изменениям live regression, отдельный длительный прогон/замеры; затем single-instance, user service и recovery по [design](EVERYDAY-DESIGN.md). Не включать автозапуск сейчас. |
+| 5. v0.3 Agent Mode | [Проект](AGENT-MODE-DESIGN.md): plan-only → allowlisted tools/validation → confirmation/executor/verification. Не произвольный shell. |
+| 6. Расширение | Notes/reminders и другие запросы по реальному использованию, отдельные tests/acceptance. |
+
+Метрики и targets после baseline — [PERFORMANCE-BACKLOG.md](PERFORMANCE-BACKLOG.md).
+Предложение release/merge — [CHECKPOINT.md](CHECKPOINT.md); ни tag, ни merge
+из этой очереди автоматически не выполняется.
 
 ## Не блокировать друг другом
 Подключение внешнего микрофона и колонок — отдельная аппаратная задача.

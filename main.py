@@ -415,7 +415,8 @@ def match_intent(text, pending=None):
 
 class CommandSession:
     """Одна команда на обращение, максимум две попытки."""
-    def __init__(self):
+    def __init__(self, executor=None):
+        self.executor = executor
         self.failures = 0
         self.pending = None
 
@@ -427,7 +428,7 @@ class CommandSession:
             if self.failures < 2:
                 return UNKNOWN, 'listening'
             return 'Не понял. Возвращаюсь в режим ожидания.', 'waiting'
-        return command(text, cfg, speech, intent, value), 'waiting'
+        return (self.executor or command)(text, cfg, speech, intent, value), 'waiting'
 
 
 def volume(text, cfg):
@@ -579,10 +580,72 @@ def load_model(cfg, Model):
     return Model(str(path))
 
 
-def listen(cfg, duration=0, check_mode=None):
-    sd, Model, Recognizer = dependencies()
-    model = load_model(cfg, Model)
-    speech = Speech(cfg)
+class FreshWakeRecognizer:
+    """Reset the entire wake backend, including Vosk's retained acoustic state.
+
+    Vosk Reset() alone can replay a previous partial after recognition was
+    interrupted by the wake acknowledgement. Keep the shared Model/grammar;
+    construct the next small recognizer lazily on its first admitted PCM.
+    """
+    def __init__(self, factory):
+        self.factory = factory
+        self.rec = factory()
+
+    def Reset(self):
+        self.rec = None
+
+    def _current(self):
+        if self.rec is None:
+            self.rec = self.factory()
+        return self.rec
+
+    def AcceptWaveform(self, pcm):
+        return self._current().AcceptWaveform(pcm)
+
+    def Result(self):
+        return self._current().Result()
+
+    def PartialResult(self):
+        return self._current().PartialResult()
+
+
+class ListenRuntime:
+    """External dependencies only. No scheduler or replay code in the default path."""
+    def monotonic(self):
+        return time.monotonic()
+
+    def observe(self, event, **fields):
+        pass
+
+    def recognition(self, cfg):
+        sd, Model, Recognizer = dependencies()
+        return sd, load_model(cfg, Model), Recognizer
+
+    def speech(self, cfg):
+        return Speech(cfg)
+
+    def bridge(self, cfg):
+        return Bridge(cfg)
+
+    def guard(self, cfg):
+        return OutputGuard(cfg)
+
+    def execute(self, text, cfg, speech, intent, value):
+        self.observe('intent_matched', intent=intent)
+        return command(text, cfg, speech, intent, value)
+
+    def read_audio(self, audio, timeout):
+        return audio.get(timeout=timeout)
+
+    def running(self):
+        return True
+
+
+def listen(cfg, duration=0, check_mode=None, *, runtime=None):
+    runtime = ListenRuntime() if runtime is None else runtime
+    clock, observe = runtime.monotonic, runtime.observe
+    sd, model, Recognizer = runtime.recognition(cfg)
+    speech = runtime.speech(cfg)
     audio = FreshAudioQueue(maxsize=12)
     issues = queue.Queue(maxsize=1)
     rate = cfg['sample_rate']
@@ -590,17 +653,19 @@ def listen(cfg, duration=0, check_mode=None):
     def callback(data, frames, timing, status):
         if status and issues.empty():
             issues.put_nowait(str(status))
-        audio.put_latest((time.monotonic(), CapturedPCM.from_callback(data, frames, rate, timing)),
+        audio.put_latest((clock(), CapturedPCM.from_callback(data, frames, rate, timing)),
                          discontinuity=bool(status))
-    def recognizer(words):
-        return Recognizer(model, rate, json.dumps(words, ensure_ascii=False))
-    wake = recognizer(['михаил', 'михаил борисович', '[unk]'])
+    def recognizer(words, *, fresh_on_reset=False):
+        grammar = json.dumps(words, ensure_ascii=False)
+        factory = lambda: Recognizer(model, rate, grammar)
+        return FreshWakeRecognizer(factory) if fresh_on_reset else factory()
+    wake = recognizer(['михаил', 'михаил борисович', '[unk]'], fresh_on_reset=True)
     commands = recognizer(GRAMMAR)
-    session = CommandSession()
-    bridge = Bridge(cfg)
-    guard = OutputGuard(cfg)
+    session = CommandSession(executor=runtime.execute)
+    bridge = runtime.bridge(cfg)
+    guard = runtime.guard(cfg)
     control = recognizer(CONTROL_GRAMMAR)
-    gpt = GPTModes(cfg, speech, bridge, guard, control)
+    gpt = GPTModes(cfg, speech, bridge, guard, control, clock=clock, observer=observe)
     accept_after = float('inf')
     command_capture_after = None  # PortAudio clock, never compared to monotonic.
     handoff = None
@@ -632,7 +697,7 @@ def listen(cfg, duration=0, check_mode=None):
     deadline = 0
     tail = 0
     preroll = deque(maxlen=3)
-    began = time.monotonic()
+    began = clock()
     last_audio = began
     drop_counts = {'overflow': 0, 'stale': 0}
     next_audio_report = began
@@ -650,7 +715,7 @@ def listen(cfg, duration=0, check_mode=None):
                 gpt.start(check_mode)
             else:
                 speech.say('Михаил Борисович готов. Скажите Михаил.', remember=False)
-            while not duration or time.monotonic() - began < duration:
+            while (not duration or clock() - began < duration) and runtime.running():
                 if output_lost.is_set():
                     raise BrokenPipeError('Output channel closed')
                 if not stream.active:
@@ -659,20 +724,23 @@ def listen(cfg, duration=0, check_mode=None):
                     report_handoff()
                 if not issues.empty():
                     log('ERROR', issues.get_nowait())
-                drop_counts['overflow'] += audio.take_dropped()
-                if time.monotonic() >= next_audio_report and any(drop_counts.values()):
+                dropped = audio.take_dropped()
+                drop_counts['overflow'] += dropped
+                if dropped:
+                    observe('audio_drop', reason='overflow', count=dropped)
+                if clock() >= next_audio_report and any(drop_counts.values()):
                     log('AUDIO', f"Discarded frames: overflow={drop_counts['overflow']}, stale={drop_counts['stale']}")
                     drop_counts = {'overflow': 0, 'stale': 0}
-                    next_audio_report = time.monotonic() + 2
+                    next_audio_report = clock() + 2
                 if gpt.active:
                     try:
-                        captured, data, discontinuity = audio.get(timeout=.2)
+                        captured, data, discontinuity = runtime.read_audio(audio, .2)
                     except queue.Empty:
-                        gpt.tick(time.monotonic())
-                        if time.monotonic() - last_audio > 3:
+                        gpt.tick(clock())
+                        if clock() - last_audio > 3:
                             raise RuntimeError('Микрофон не передает звук более трех секунд.')
                     else:
-                        last_audio = time.monotonic()
+                        last_audio = clock()
                         if isinstance(data, CapturedPCM):
                             data = data.pcm
                         if discontinuity:
@@ -683,17 +751,18 @@ def listen(cfg, duration=0, check_mode=None):
                     if not gpt.active:
                         if guard.close() is False:
                             raise RuntimeError('Speaker monitor shutdown not confirmed; replacement blocked.')
-                        guard = OutputGuard(cfg)
+                        guard = runtime.guard(cfg)
                         gpt.guard = guard
                         state = 'waiting'
                         wake.Reset()
                         commands.Reset()
                         clear_audio()
-                        accept_after = time.monotonic()
+                        accept_after = clock()
                         command_capture_after = None
                         tail = 0
                         preroll.clear()
                         log('WAITING')
+                        observe('local_state', state='waiting')
                     continue
                 playback_ready = False
                 if state == 'speaking' and not speech.busy():
@@ -703,50 +772,53 @@ def listen(cfg, duration=0, check_mode=None):
                         if not isinstance(boundary, (int, float)) or not math.isfinite(boundary):
                             raise RuntimeError('Недостоверная граница окончания «Слушаю».')
                         command_capture_after = boundary
-                        handoff = audio.trim_wake(time.monotonic(), stream.time, boundary)
+                        handoff = audio.trim_wake(clock(), stream.time, boundary)
                         if handoff['last_arrival'] is not None:
                             last_audio = max(last_audio, handoff['last_arrival'])
                         handoff.update(boundary=boundary, poll_lag=stream.time-boundary,
                                        kept=len(handoff['pending']), stale_after=0, result_stale=0,
                                        overflow=audio.discontinuities-wake_overflow_start)
+                        observe('playback_handoff', boundary=boundary, depth=handoff['depth'],
+                                dropped=handoff['dropped'], post_kept=handoff['kept'])
                         accept_after = float('-inf')
                         playback_ready = True
                     else:
                         state = 'cooldown'
-                        deadline = time.monotonic() + cfg.get('tts_cooldown_ms', 500) / 1000
+                        deadline = clock() + cfg.get('tts_cooldown_ms', 500) / 1000
                         clear_audio()
-                if playback_ready or (state == 'cooldown' and time.monotonic() >= deadline):
+                if playback_ready or (state == 'cooldown' and clock() >= deadline):
                     state = next_state
                     wake.Reset()
                     commands.Reset()
                     if not playback_ready:
                         clear_audio()
-                        accept_after = time.monotonic()
+                        accept_after = clock()
                         command_capture_after = None
                     readiness = 'cooldown'
                     tail = 0
                     preroll.clear()
-                    deadline = time.monotonic() + cfg['command_timeout']
+                    deadline = clock() + cfg['command_timeout']
                     log('LISTENING' if state == 'listening' else 'WAITING')
+                    observe('local_state', state=state)
                 if state == 'speaking' and readiness == 'playback_end':
                     # Drain only already-expired PCM while waiting. Fresh PCM
                     # can belong to the user before this loop observes exit.
-                    trimmed = audio.trim_wake(time.monotonic(), stream.time)
+                    trimmed = audio.trim_wake(clock(), stream.time)
                     wake_trimmed += trimmed['dropped']
                     if trimmed['last_arrival'] is not None:
                         last_audio = max(last_audio, trimmed['last_arrival'])
                     speech.wait_for_completion(.2)
                     continue
-                if state == 'listening' and time.monotonic() > deadline:
+                if state == 'listening' and clock() > deadline:
                     speech.say('Не услышал команду.', remember=False)
                     state, next_state = 'speaking', 'waiting'
                 try:
-                    captured, data, discontinuity = audio.get(timeout=0.2)
+                    captured, data, discontinuity = runtime.read_audio(audio, .2)
                 except queue.Empty:
-                    if time.monotonic() - last_audio > 3:
+                    if clock() - last_audio > 3:
                         raise RuntimeError('Микрофон не передает звук более трех секунд.')
                     continue
-                last_audio = time.monotonic()
+                last_audio = clock()
                 capture = data if isinstance(data, CapturedPCM) else None
                 if capture is not None:
                     data = capture.pcm
@@ -758,18 +830,21 @@ def listen(cfg, duration=0, check_mode=None):
                     handoff['pending'].remove(id(capture))
                     handoff['stale_after'] += int(stale)
                 if discontinuity or stale:
+                    observe('audio_gap', scope='local', reason='stale' if stale else 'gap')
                     wake.Reset()
                     commands.Reset()
                     preroll.clear()
                     tail = 0
                 if stale:
                     drop_counts['stale'] += 1
+                    observe('audio_drop', reason='stale', count=1)
                     continue
                 if state in ('speaking', 'cooldown', 'chatgpt_busy') or captured <= accept_after:
                     continue
                 if command_capture_after is not None:
                     if capture is None or capture.start is None or capture.start < command_capture_after:
                         commands.Reset()
+                        observe('audio_drop', reason='playback_boundary', count=1)
                         continue  # Includes every block straddling the end.
                 if state == 'waiting':
                     samples = array('h', data)[::4]
@@ -788,7 +863,7 @@ def listen(cfg, duration=0, check_mode=None):
                 final = rec.AcceptWaveform(data)
                 result = json.loads(rec.Result() if final else rec.PartialResult())
                 if state == 'listening' and command_capture_after is not None and (
-                        not 0 <= time.monotonic()-captured <= .4 or
+                        not 0 <= clock()-captured <= .4 or
                         not 0 <= stream.time-capture.start <= .4):
                     # Recognition itself may stall. Never execute its now-old
                     # command or retain a partial result across that gap.
@@ -800,11 +875,12 @@ def listen(cfg, duration=0, check_mode=None):
                 text = result.get('text' if final else 'partial', '')
                 if state == 'waiting' and 'михаил' in text.split():
                     log('WAKE WORD', text)
+                    observe('wake_detected', text=normalize(text)[:240])
                     report_handoff()
                     wake_trimmed = 0
                     wake_overflow_start = audio.discontinuities
                     speech.say('Слушаю', remember=False, completion_clock=lambda: stream.time)
-                    session = CommandSession()
+                    session = CommandSession(executor=runtime.execute)
                     state, next_state = 'speaking', 'listening'
                     readiness = 'playback_end'
                 elif state == 'listening' and final:
@@ -814,9 +890,11 @@ def listen(cfg, duration=0, check_mode=None):
                         diagnostic_text = normalize(text)
                         log('LOCAL ASR', f'final={json.dumps(diagnostic_text[:240], ensure_ascii=False)} '
                             f'intent={diagnostic_intent or "NONE"}' + (' truncated=true' if len(diagnostic_text) > 240 else ''))
+                        observe('local_asr_final', text=diagnostic_text[:240], intent=diagnostic_intent)
                         if not text:
                             continue  # Preserve empty-final behavior; no automatic retry.
                         if intent in ('CHATGPT_OPEN', 'LARISA_OPEN', 'ANTON_OPEN'):
+                            observe('intent_matched', intent=intent)
                             gpt.start(ANTON_MODE if intent == 'ANTON_OPEN' else LARISA_MODE)
                             clear_audio()
                             continue

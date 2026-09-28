@@ -1,0 +1,259 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "id": "local-clip-start-0",
+      "tags": [
+        "local",
+        "clip_start"
+      ],
+      "duration": 22,
+      "system_actions": [
+        "TIME"
+      ],
+      "steps": [
+        {
+          "clip": "wake-mikhail-01",
+          "at": "initial_waiting"
+        },
+        {
+          "clip": "local-time-01",
+          "at": "wake_ack.playback_end",
+          "align": "clip_start",
+          "offset_ms": 0
+        }
+      ],
+      "timing": {
+        "callback_delay_ms": 0,
+        "main_loop_delay_after_playback_ms": 200
+      },
+      "expected": {
+        "local_intents": [
+          "TIME"
+        ],
+        "wake_count": 1,
+        "action_counts": {
+          "open": 0,
+          "open_anton": 0,
+          "send": 0
+        }
+      }
+    },
+    {
+      "id": "local-speech-onset-0",
+      "tags": [
+        "local",
+        "speech_onset"
+      ],
+      "duration": 22,
+      "system_actions": [
+        "TIME"
+      ],
+      "steps": [
+        {
+          "clip": "wake-mikhail-01",
+          "at": "initial_waiting"
+        },
+        {
+          "clip": "local-time-01",
+          "at": "wake_ack.playback_end",
+          "align": "speech_onset",
+          "offset_ms": 0
+        }
+      ],
+      "timing": {
+        "callback_delay_ms": 0,
+        "main_loop_delay_after_playback_ms": 200
+      },
+      "expected": {
+        "local_intents": [
+          "TIME"
+        ],
+        "wake_count": 1,
+        "action_counts": {
+          "open": 0,
+          "open_anton": 0,
+          "send": 0
+        }
+      },
+      "required": false
+    },
+    {
+      "id": "anton-open",
+      "tags": [
+        "gpt"
+      ],
+      "steps": [
+        {
+          "clip": "wake-mikhail-01",
+          "at": "initial_waiting"
+        },
+        {
+          "clip": "anton-open-01",
+          "at": "wake_ack.playback_end"
+        }
+      ],
+      "bridge": {
+        "open_anton": {}
+      },
+      "stop_at": "mode.ANTON_MODE",
+      "expected": {
+        "action_counts": {
+          "open_anton": 1,
+          "send": 0,
+          "dictate": 0
+        },
+        "modes": [
+          "ANTON_MODE"
+        ]
+      }
+    },
+    {
+      "id": "anton-atomic-pending",
+      "tags": [
+        "gpt",
+        "atomic"
+      ],
+      "steps": [
+        {
+          "clip": "wake-mikhail-01",
+          "at": "initial_waiting"
+        },
+        {
+          "clip": "anton-open-01",
+          "at": "wake_ack.playback_end"
+        },
+        {
+          "clip": "atomic-return-planned-01",
+          "at": "bridge.open_anton",
+          "offset_ms": 3000
+        }
+      ],
+      "bridge": {
+        "open_anton": {
+          "delay_ms": 20000,
+          "late_result": true
+        },
+        "close": {
+          "delay_ms": 1000
+        }
+      },
+      "duration": 42,
+      "expected": {
+        "action_counts": {
+          "open_anton": 1,
+          "close": 1,
+          "send": 0,
+          "dictate": 0
+        },
+        "returns": [
+          "ATOMIC_RETURN"
+        ],
+        "forbidden_modes": [
+          "ANTON_MODE"
+        ],
+        "cleanup_confirmed": true
+      }
+    },
+    {
+      "id": "larisa-two-step",
+      "tags": [
+        "gpt",
+        "control"
+      ],
+      "duration": 42,
+      "bridge": {
+        "open": {},
+        "poll": {},
+        "pause": {},
+        "close": {
+          "delay_ms": 1000
+        }
+      },
+      "steps": [
+        {
+          "clip": "wake-mikhail-01",
+          "at": "initial_waiting"
+        },
+        {
+          "clip": "larisa-open-01",
+          "at": "wake_ack.playback_end"
+        },
+        {
+          "clip": "return-wake-01",
+          "at": "mode.LARISA_MODE",
+          "offset_ms": 3000
+        },
+        {
+          "clip": "return-command-01",
+          "at": "control_ack.playback_end",
+          "offset_ms": 1200
+        }
+      ],
+      "expected": {
+        "action_counts": {
+          "open": 1,
+          "pause": 1,
+          "close": 1,
+          "send": 0
+        },
+        "returns": [
+          "WAKE",
+          "RETURN"
+        ],
+        "cleanup_confirmed": true
+      }
+    },
+    {
+      "id": "local-overflow-then-fresh",
+      "tags": [
+        "local",
+        "clip_start"
+      ],
+      "duration": 25,
+      "system_actions": [
+        "TIME"
+      ],
+      "steps": [
+        {
+          "clip": "wake-mikhail-01",
+          "at": "initial_waiting"
+        },
+        {
+          "clip": "local-time-01",
+          "at": "wake_ack.playback_end",
+          "align": "clip_start",
+          "offset_ms": 0
+        },
+        {
+          "kind": "main_delay",
+          "at": "wake_ack.playback_end",
+          "duration_ms": 6000
+        },
+        {
+          "clip": "local-time-01",
+          "at": "clip.local-time-01.end",
+          "offset_ms": 1500
+        }
+      ],
+      "timing": {
+        "callback_delay_ms": 0,
+        "main_loop_delay_after_playback_ms": 200
+      },
+      "expected": {
+        "local_intents": [
+          "TIME"
+        ],
+        "wake_count": 1,
+        "action_counts": {
+          "open": 0,
+          "open_anton": 0,
+          "send": 0
+        },
+        "min_overflow": 1,
+        "min_audio_gaps": 1,
+        "min_resets": 3
+      }
+    }
+  ]
+}
